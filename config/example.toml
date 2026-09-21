@@ -22,3 +22,11 @@ room_id = "!engineering:example.invalid"
 operators = ["@owner:example.invalid"]
 audience = ["@owner:example.invalid", "@engineering-agent:example.invalid"]
 conversation = "thread"
+audience_policy = "room_membership" # Matrix membership controls readers; audience is unused.
+
+# Normal bot onboarding: exact operator allowlist and known Matrix sender devices.
+# Use "verified" instead to additionally require cross-signing/SAS verification.
+operator_trust = "account"
+# Optional on an appropriately isolated worker: auto-approve offered allow_once choices.
+# tool_approval = "automatic"
+# Otherwise an operator can use !bridge allow-thread in one conversation.

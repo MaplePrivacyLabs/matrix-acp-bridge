@@ -6,7 +6,7 @@ The bridge is an ordinary client of the Matrix Client-Server API, built with Mat
 
 Enrollment currently uses Matrix password login and cross-signing bootstrap. A server with only browser-based OIDC/SSO login needs additional enrollment support. There is no generic account-creation API: create the bot using your provider's usual signup/invite process. Use a dedicated account rather than repurposing an existing personal account with other sessions/keys.
 
-Work rooms must be encrypted. Senders must be allowlisted operators, current members, and verified through their cross-signing identity/device. Outbound room keys are shared with room members' unblocked devices, including unverified devices. Readers do not need a separate verification ceremony with the bot; the stricter verified-sender check applies to commands and approvals. Plaintext rooms are deliberately unsupported in this version.
+Work rooms must be encrypted. Senders must be allowlisted operators and current members. Account trust uses known Matrix sender devices without per-person verification; verified trust additionally requires cross-signing identity/device verification. Outbound room keys are shared with room members' unblocked devices, including unverified devices. Readers do not need a separate verification ceremony with the bot; the selected sender-trust policy applies to commands and approvals. Plaintext rooms are deliberately unsupported in this version.
 
 Stock Element desktop was used for live verification, mentions and thread replies. Other Matrix clients need compatible encrypted threads, mentions and verification UI; this project's current tests do not establish every client's behavior. Room membership, reactions and other metadata are not hidden by message encryption.
 
@@ -36,9 +36,9 @@ One config describes one bot and one agent/workspace profile, with one or more r
 
 ## Prototype limits
 
-- Text messages only. No attachment download, image input, edit-as-prompt, room-history ingestion or rich artifact upload.
+- Text messages only. Full prior thread text and its parent are included. No attachment download, image input, edit-as-prompt or rich artifact upload.
 - No mid-turn queuing or steering. Wait, or cancel and resend.
-- Policy/membership changes invalidate conversation bindings. Start a new thread after reviewing the change; existing room-mode bindings need future migration tooling.
+- Room-membership mode permits membership/operator changes without resetting threads. Configured-audience mode retains strict policy/roster bindings. Worker runtime changes still need a fresh binding.
 - Provider-specific model/config controls and ACP extensions are not exposed in Matrix yet. Configure defaults in the agent's own profile.
 - Sync continuity/decryption failures stop progress conservatively. Backfill is limited to 500 events; longer gaps need operator recovery tooling.
 - Enrollment and verification are CLI flows. Packaged binaries, a setup UI and broader provider/client testing are follow-up work.

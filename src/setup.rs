@@ -105,12 +105,7 @@ fn gather(
         "Operator Matrix IDs (comma-separated)",
         "",
     )?);
-    let mut audience = ids(&ask(
-        input,
-        output,
-        "Other permitted readers (comma-separated; Enter for none)",
-        "",
-    )?);
+    let mut audience = BTreeSet::new();
     audience.extend(operators.iter().cloned());
     audience.insert(bot_user_id.clone());
     let state_dir = if service {
@@ -190,8 +185,11 @@ fn gather(
         rooms: vec![RoomPolicy {
             room_id,
             operators,
+            operator_trust: crate::config::OperatorTrust::Account,
             audience,
+            audience_policy: crate::config::AudiencePolicy::RoomMembership,
             conversation: ConversationMode::Thread,
+            tool_approval: Default::default(),
         }],
         approval_ttl_seconds: 300,
         max_concurrent_runs: 1,
@@ -215,7 +213,7 @@ pub fn interactive(file: &Path, service: bool) -> Result<()> {
         "Created {}. Review its operators, audience, and harness mode.",
         absolute.display()
     );
-    println!("Next: doctor, enroll, verify each operator, then run (use --config for this file).");
+    println!("Next: doctor, enroll, then run (use --config for this file).");
     if service {
         println!(
             "Before using the service profile: chown root:matrix-acp-bridge CONFIG; chmod 0640 CONFIG."
@@ -235,13 +233,21 @@ mod tests {
     #[test]
     fn wizard_round_trip_preserves_argv_and_audience_and_writes_privately() {
         let temp = tempfile::tempdir().unwrap();
-        let answers = "@bot:example.org\nhttps://matrix.example.org\n!room:example.org\n@alice:example.org\n@bob:example.org\n/usr/bin/agent\n[\"acp\",\"path with spaces\"]\n\nread-only\n/agent/home\n\n";
+        let answers = "@bot:example.org\nhttps://matrix.example.org\n!room:example.org\n@alice:example.org\n/usr/bin/agent\n[\"acp\",\"path with spaces\"]\n\nread-only\n/agent/home\n\n";
         let config = gather(&mut answers.as_bytes(), &mut Vec::new(), temp.path(), false).unwrap();
         let file = temp.path().join("config.toml");
         write_config(&file, &config).unwrap();
         let parsed = Config::parse(&std::fs::read_to_string(&file).unwrap()).unwrap();
         assert_eq!(parsed.harness.args, ["acp", "path with spaces"]);
-        assert_eq!(parsed.rooms[0].audience.len(), 3);
+        assert_eq!(parsed.rooms[0].audience.len(), 2);
+        assert_eq!(
+            parsed.rooms[0].audience_policy,
+            crate::config::AudiencePolicy::RoomMembership
+        );
+        assert_eq!(
+            parsed.rooms[0].operator_trust,
+            crate::config::OperatorTrust::Account
+        );
         assert_eq!(parsed.rooms[0].operators.len(), 1);
         assert_eq!(parsed.state_dir, temp.path().join("state"));
         assert!(write_config(&file, &config).is_err());

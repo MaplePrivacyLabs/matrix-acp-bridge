@@ -199,6 +199,36 @@ async fn configured_event(
     Ok(incoming)
 }
 
+/// Read-only context diagnostic. No ACP connection or message body output.
+pub async fn inspect_context(config: Config, event_id: &str) -> Result<()> {
+    let store = Store::open(&config.state_dir, &config.bot_user_id)?;
+    let client = restore_client(&config).await?;
+    let event = configured_event(&client, &config, event_id).await?;
+    let adapter = MatrixAdapter::from_client(&config, client)?;
+    let history = adapter.context_for(&event).await?;
+    let prompt = crate::context::prompt(&config, &event, &history)?;
+    let snapshot = adapter.snapshot(&event.room_id).await?;
+    let bridge = Bridge::new(config.clone(), store)?;
+    let members: std::collections::BTreeSet<_> = history.iter().map(|e| e.sender.clone()).collect();
+    println!(
+        "{}",
+        serde_json::json!({
+            "event_id":event_id,
+            "thread_root":event.thread_root,
+            "history_messages":history.len(),
+            "parent_included":event.thread_root.as_ref().is_some_and(|root|history.iter().any(|e| &e.event_id==root)),
+            "context_senders":members,
+            "prompt_bytes":prompt.len(),
+            "agent_started":false,
+            "journal_runs":bridge.store.count_runs()?,
+            "sender_authorized":bridge.authorized(&event, &snapshot),
+            "known_sender_device":event.known_sender_device,
+            "cross_verified":event.verified_device,
+        })
+    );
+    Ok(())
+}
+
 /// Explicit operator diagnostic; unlike status, this prints the selected body.
 pub async fn inspect_event(config: Config, event_id: &str) -> Result<()> {
     let _store = Store::open(&config.state_dir, &config.bot_user_id)?;
@@ -315,7 +345,7 @@ pub async fn enroll(config: Config) -> Result<()> {
             "bot absent from joined room membership"
         );
         ensure!(
-            snapshot.members.is_subset(&policy.audience),
+            policy.permits_members(&snapshot.members),
             "unexpected joined member in {}; review audience before running",
             policy.room_id
         );
@@ -330,7 +360,9 @@ pub async fn enroll(config: Config) -> Result<()> {
         "Device ID: {}",
         adapter.client().device_id().context("device ID missing")?
     );
-    println!("Verify this device and the operator in Element before accepting prompts.");
+    println!(
+        "Operator trust follows configuration. Account trust needs no per-person verification."
+    );
     Ok(())
 }
 
@@ -473,7 +505,7 @@ async fn one_step(adapter: &MatrixAdapter, runner: &mut Runner) -> Result<()> {
     )
     .await
     .context("Matrix sync timed out")??;
-    MatrixAdapter::ingest_batch(runner, batch, now()).await?;
+    adapter.ingest_live_batch(runner, batch, now()).await?;
     while runner.try_update()?.is_some() {}
     runner.tick(now()).await?;
     tokio::time::timeout(Duration::from_secs(15), adapter.deliver(runner))
@@ -498,7 +530,10 @@ pub async fn run(config: Config, retry_event: Option<&str>) -> Result<()> {
     if let Some(event_id) = retry_event {
         let event = configured_event(adapter.client(), &runner.bridge.config, event_id).await?;
         let snapshot = adapter.snapshot(&event.room_id).await?;
-        let handled = runner.ingest(&event, &snapshot, now()).await?;
+        let context = adapter.context_for(&event).await?;
+        let handled = runner
+            .ingest_with_context(&event, &snapshot, Some(&context), now())
+            .await?;
         eprintln!("Explicit event recovery: {:?}", handled.disposition);
     }
     let mut failures = 0u32;
@@ -511,7 +546,7 @@ pub async fn run(config: Config, retry_event: Option<&str>) -> Result<()> {
                 Ok(()) => {
                     failures = 0;
                     if !ready {
-                        eprintln!("Ready. Send a new verified bot mention in a configured room.");
+                        eprintln!("Ready. An approved operator can mention the bot in a configured room.");
                         ready = true;
                     }
                 },

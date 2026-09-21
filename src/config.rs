@@ -47,10 +47,20 @@ pub struct HarnessConfig {
 pub struct RoomPolicy {
     pub room_id: String,
     pub operators: BTreeSet<String>,
+    /// Account trust uses Matrix's authenticated device list; verified adds SAS.
+    /// Legacy configs retain verified trust unless explicitly changed.
+    #[serde(default, skip_serializing_if = "OperatorTrust::is_verified")]
+    pub operator_trust: OperatorTrust,
     /// All permitted readers, including the bot. Unknown joined readers block work.
+    #[serde(default)]
     pub audience: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "AudiencePolicy::is_configured")]
+    pub audience_policy: AudiencePolicy,
     #[serde(default)]
     pub conversation: ConversationMode,
+    /// Automatic decisions only select an ACP allow option offered by the agent.
+    #[serde(default, skip_serializing_if = "ToolApproval::is_manual")]
+    pub tool_approval: ToolApproval,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -59,6 +69,64 @@ pub enum ConversationMode {
     Room,
     #[default]
     Thread,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApproval {
+    #[default]
+    Manual,
+    Automatic,
+}
+
+impl ToolApproval {
+    fn is_manual(&self) -> bool {
+        *self == Self::Manual
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorTrust {
+    Account,
+    #[default]
+    Verified,
+}
+
+impl OperatorTrust {
+    fn is_verified(&self) -> bool {
+        *self == Self::Verified
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AudiencePolicy {
+    #[default]
+    Configured,
+    RoomMembership,
+}
+
+impl AudiencePolicy {
+    fn is_configured(&self) -> bool {
+        *self == Self::Configured
+    }
+}
+
+impl RoomPolicy {
+    pub fn permits_members(&self, members: &BTreeSet<String>) -> bool {
+        self.audience_policy == AudiencePolicy::RoomMembership || members.is_subset(&self.audience)
+    }
+    pub fn permits_context_sender(&self, sender: &str) -> bool {
+        self.audience_policy == AudiencePolicy::RoomMembership || self.audience.contains(sender)
+    }
+    pub fn audience_binding(&self, members: &BTreeSet<String>) -> String {
+        if self.audience_policy == AudiencePolicy::RoomMembership {
+            "room-membership".into()
+        } else {
+            digest(&serde_json::to_vec(members).expect("members serialize"))
+        }
+    }
 }
 
 impl Config {
@@ -117,11 +185,13 @@ impl Config {
                 "bot cannot be its own operator"
             );
             ensure!(
-                room.audience.contains(&self.bot_user_id),
+                room.audience_policy == AudiencePolicy::RoomMembership
+                    || room.audience.contains(&self.bot_user_id),
                 "audience must include bot"
             );
             ensure!(
-                room.operators.is_subset(&room.audience),
+                room.audience_policy == AudiencePolicy::RoomMembership
+                    || room.operators.is_subset(&room.audience),
                 "operators must belong to configured audience"
             );
             for user in &room.audience {
@@ -141,6 +211,29 @@ impl Config {
     /// Binding identity includes credential configuration, but never stores its plaintext.
     pub fn fingerprint(&self) -> String {
         digest(&serde_json::to_vec(self).expect("config serialization is infallible"))
+    }
+
+    /// In room-membership mode, access rules apply on each request; adding an
+    /// operator or reader does not invalidate a coding session. Runtime/credential
+    /// changes still get a new binding. Legacy configured audiences remain strict.
+    pub fn binding_fingerprint(&self, room_id: &str) -> String {
+        let Some(room) = self.room(room_id) else {
+            return self.fingerprint();
+        };
+        if room.audience_policy == AudiencePolicy::Configured {
+            return self.fingerprint();
+        }
+        digest(
+            &serde_json::to_vec(&(
+                &self.bot_user_id,
+                &self.homeserver,
+                &self.harness,
+                &room.room_id,
+                room.conversation,
+                "room-membership-v1",
+            ))
+            .expect("binding serializes"),
+        )
     }
 
     pub fn room(&self, id: &str) -> Option<&RoomPolicy> {

@@ -6,7 +6,7 @@ Bring your own coding agent into a Matrix room. Mention its bot account to start
 
 - Normal bot accounts on a compatible hosted or self-hosted Matrix server. No Matrix administrator token or server modification.
 - Your choice of ACP stdio agent, permission mode, workspace and credentials.
-- Verified encrypted messages, explicit operators and room audiences, and separate sessions per thread or room.
+- Encrypted messages, explicit operators and room audiences, optional cross-verification, and separate sessions per thread or room.
 - Human approval requests in the conversation, cancellation, persistent sessions and a durable inbox/outbox.
 - Status reactions: 👀 accepted, ✅ completed, ❌ failed, 🛑 cancelled, ⚠️ interrupted. Answers stay in the thread.
 
@@ -38,16 +38,17 @@ cargo build --locked --release --features matrix
 
 Only explicitly configured environment variables reach the adapter. Include the runtime directory in PATH when an adapter needs Node, Python, or another runtime. Do not point the worker at a privileged administrator's HOME. See [the example config](config/example.toml) for the complete format.
 
-### 3. Enroll and verify
+### 3. Enroll
 
 ```sh
 ./target/release/matrix-acp-bridge enroll
-./target/release/matrix-acp-bridge verify '@you:example.org'
 ```
 
-`enroll` asks for the bot password locally, creates its persistent encrypted device store and joins only the configured invitations. Keep Element open on a **verified** human device. `verify` lists your devices; choose that active device, accept the request in Element, compare the emojis on both screens, and type `MATCH` in the worker terminal **only if they match**. Repeat for each operator who will direct the agent. Both the sending device and cross-signing identity must be verified; a local device trust flag alone is insufficient. **Reading replies does not require verification with the bot:** reply keys are shared with room members' unblocked devices, including unverified devices.
+`enroll` asks for the bot password locally, creates its persistent encrypted device store and joins only the configured invitations. The wizard and example use `operator_trust = "account"`: adding a teammate’s Matrix ID to `operators` and `audience` is enough. No per-person bot DM or emoji ceremony is required. Messages must still come from a known Matrix sender device without an SDK trust violation, in the configured encrypted room. Reading replies also works on unverified devices unless blocked.
 
-This is the trust handshake, not an administrator login. Keep the bot's state directory: recreating it creates a different device and loses the stored sessions/keys. See [troubleshooting](docs/TROUBLESHOOTING.md) if verification or delivery fails.
+For workers that require independent identity verification, use `operator_trust = "verified"` and run `matrix-acp-bridge verify '@you:example.org'` for each operator. Keep Element open on a verified device, select that device, compare the emojis and type `MATCH` only if they match. Both identity and sending device must be cross-verified. Configs that omit `operator_trust` keep this stricter legacy behavior.
+
+Keep the bot’s state directory: recreating it creates a different device and loses stored sessions/keys. See [troubleshooting](docs/TROUBLESHOOTING.md) if enrollment or delivery fails.
 
 ### 4. Start and talk
 
@@ -57,7 +58,7 @@ This is the trust handshake, not an administrator login. Keep the bot's state di
 
 Wait for the initial sync, then send a **real Matrix mention pill** for the bot in the room, such as “@my-agent please explain this project's tests.” It reacts 👀, answers in a thread, and reacts ✅ when finished. Reply **in that thread** to continue; another mention is not required there. Send a new room mention to start a separate thread/session.
 
-Messages predating the first run's sync baseline do not start work. Ordinary room messages are not automatically sent to the agent. The initial prompt contains the triggering message, not the entire room's history; include or quote the context you want it to use. Attachments and edits are not yet agent inputs.
+Messages predating the first run's sync baseline do not start work. When an operator requests work in a thread, the bridge automatically supplies its parent and all earlier decryptable text replies, including messages from permitted readers who are not operators. It paginates the whole thread without a hidden message limit. History is labeled as conversation data; only the current authorized request starts work. A new room-level mention receives nearby preceding context (a 40-event Matrix context window), plus an explicit reply target when present. Attachments and edits are not yet agent inputs.
 
 ## Permissions and conversations
 
@@ -67,13 +68,21 @@ Inside the established thread:
 !bridge status
 !bridge stop
 !bridge approve <request-id> <offered-option-id>
+!bridge allow-thread
+!bridge approvals manual
 ```
 
-Approval choices come from the adapter and include its offered denial option. Only an authorized verified operator in that conversation may answer. Requests expire and are cancelled on restart. Reactions cannot grant approval. Which operations ask for approval depends on the adapter and its configured mode; the bridge is not an OS sandbox.
+Approval choices come from the adapter and include its offered denial option. Only an authorized operator meeting the room’s configured sender-trust policy may answer. Requests expire and are cancelled on restart. Reactions cannot grant approval. Which operations ask for approval depends on the adapter and its configured mode; the bridge is not an OS sandbox.
 
-`operators` may start/control work; `audience` lists all permitted room readers, including the bot. A newly joined reader outside that list blocks work and delivery. **Threads share the room's audience.** Give each differently privileged agent its own bot account, config, state directory and isolated worker credentials. Separate ACP sessions do not isolate a shared filesystem or account.
+Use `!bridge allow-thread` to approve the pending tool request and subsequent tool requests in this conversation without copying request IDs. It persists across restarts. `!bridge approvals manual` restores individual approvals. To opt an isolated worker room into automatic approval from the start, set `tool_approval = "automatic"` in its `[[rooms]]` policy (default: `"manual"`). Automatic decisions select only an actual `allow_once` option, are recorded in the journal, and do not change the adapter's configured mode or grant OS access. Requests without that option still ask a human.
 
-Use additional `[[rooms]]` entries for more rooms. `conversation = "thread"` is the default; `"room"` uses one session for the entire room. Changing policy or joined membership invalidates existing conversation bindings. Review the change, restart, and start a new thread; migration of an existing room-mode session is not implemented.
+`operator_trust = "account"` trusts the homeserver’s authenticated device list and the explicit operator allowlist. `"verified"` additionally requires independently verified identities. Unknown or mismatched sender devices, insecure key origins and verification violations remain rejected in both modes.
+
+`operators` may start/control work. With `audience_policy = "room_membership"` (wizard/example), Matrix membership controls who reads the room; there is no second reader allowlist. Adding readers or changing operators does not invalidate existing threads. Operators must still be joined members to send a command. **Threads share the room’s audience.** Give differently privileged agents their own bot accounts and isolated worker credentials. Separate ACP sessions do not isolate a shared filesystem or account.
+
+For an additional fixed reader allowlist, use `audience_policy = "configured"` and list every reader plus the bot in `audience`. In this stricter mode, membership/config changes invalidate old bindings. Legacy configs that omit the field retain this behavior. See [all policies and current limitations](docs/POLICIES.md).
+
+Use additional `[[rooms]]` entries for more rooms. `conversation = "thread"` is the default; `"room"` uses one session for the entire room. Changing the actual harness/workspace/credentials still requires a fresh session binding; changing ordinary channel access in room-membership mode does not.
 
 A busy conversation asks you to wait, or stop and resend. Mid-turn message queuing/steering is not implemented. No hidden model-token or turn-duration limit is imposed by the bridge.
 

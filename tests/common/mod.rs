@@ -14,6 +14,8 @@ pub fn config() -> Config {
     // Exercise independent conversations concurrently; the operator example
     // conservatively defaults to one run for a shared coding workspace.
     config.max_concurrent_runs = 2;
+    config.rooms[0].audience_policy = matrix_acp_bridge::config::AudiencePolicy::Configured;
+    config.rooms[0].operator_trust = matrix_acp_bridge::config::OperatorTrust::Verified;
     config
 }
 pub fn room() -> RoomSnapshot {
@@ -34,6 +36,7 @@ pub fn message(id: &str, body: &str, root: Option<&str>) -> Incoming {
         mentions: BTreeSet::from([config().bot_user_id]),
         encrypted: true,
         verified_device: true,
+        known_sender_device: true,
     }
 }
 pub fn bridge() -> Bridge {

@@ -57,8 +57,18 @@ impl Runner {
         room: &RoomSnapshot,
         now: i64,
     ) -> Result<Handled> {
+        self.ingest_with_context(event, room, None, now).await
+    }
+
+    pub async fn ingest_with_context(
+        &mut self,
+        event: &Incoming,
+        room: &RoomSnapshot,
+        context: Option<&[Incoming]>,
+        now: i64,
+    ) -> Result<Handled> {
         self.reconcile_room(&event.room_id, room, now).await?;
-        let handled = self.bridge.handle(event, room, now)?;
+        let handled = self.bridge.handle_with_context(event, room, context, now)?;
         self.apply(&handled.effects, now).await?;
         Ok(handled)
     }
@@ -158,6 +168,8 @@ impl Runner {
 
     pub async fn tick(&mut self, now: i64) -> Result<()> {
         let effects = self.bridge.expire_approvals(now)?;
+        self.apply(&effects, now).await?;
+        let effects = self.bridge.automatic_approvals(now)?;
         self.apply(&effects, now).await?;
         self.bridge.flush_progress(now)?;
         Ok(())

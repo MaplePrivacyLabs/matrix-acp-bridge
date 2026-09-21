@@ -10,13 +10,15 @@ use anyhow::{Result, ensure};
 use matrix_sdk::{
     Client, Room, RoomMemberships, RoomState,
     config::{SyncSettings, SyncToken},
-    deserialized_responses::{TimelineEvent, TimelineEventKind, VerificationState},
-    room::MessagesOptions,
+    deserialized_responses::{
+        TimelineEvent, TimelineEventKind, VerificationLevel, VerificationState,
+    },
+    room::{IncludeRelations, MessagesOptions, RelationsOptions},
 };
 use matrix_sdk_crypto::CollectStrategy;
 use ruma::events::{
     AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
-    relation::Thread,
+    relation::{RelationType, Thread},
     room::message::{MessageType, Relation, RoomMessageEventContent},
 };
 use ruma::{api::client::sync::sync_events, serde::Raw};
@@ -281,6 +283,99 @@ impl MatrixAdapter {
         Ok(())
     }
 
+    /// All decrypted text in the thread up to this request, including a parent
+    /// written by a reader. Relations are paginated: there is no hidden thread cap.
+    pub async fn context_for(&self, event: &Incoming) -> Result<Vec<Incoming>> {
+        ensure!(
+            self.allowed_rooms.contains(&event.room_id),
+            "room is not configured"
+        );
+        let id: ruma::OwnedRoomId = event.room_id.parse()?;
+        let room = self
+            .client
+            .get_room(&id)
+            .ok_or_else(|| anyhow::anyhow!("room missing"))?;
+        if let Some(root) = &event.thread_root {
+            let root_id: ruma::OwnedEventId = root.parse()?;
+            let parent = room.event(&root_id, None).await?;
+            let mut history = vec![];
+            append_context(&event.room_id, &parent, &mut history)?;
+            let mut from = None;
+            let mut tokens = BTreeSet::new();
+            loop {
+                let options = RelationsOptions {
+                    from,
+                    dir: ruma::api::Direction::Forward,
+                    limit: Some(ruma::uint!(100)),
+                    include_relations: IncludeRelations::RelationsOfType(RelationType::Thread),
+                    ..Default::default()
+                };
+                let page = room.relations(root_id.clone(), options).await?;
+                for item in page.chunk {
+                    if item.raw().get_field::<String>("event_id")?.as_deref()
+                        == Some(&event.event_id)
+                    {
+                        return Ok(history);
+                    }
+                    append_context(&event.room_id, &item, &mut history)?;
+                }
+                let next = page.next_batch_token.ok_or_else(|| {
+                    anyhow::anyhow!("thread history did not reach the triggering event")
+                })?;
+                ensure!(
+                    tokens.insert(next.clone()),
+                    "thread history pagination repeated a token"
+                );
+                from = Some(next);
+            }
+        } else {
+            // New room-level mentions get the nearby conversation. Existing
+            // threads use the complete thread path above, never unrelated threads.
+            let id: ruma::OwnedEventId = event.event_id.parse()?;
+            let page = room
+                .event_with_context(&id, false, ruma::uint!(40), None)
+                .await?;
+            let mut history = vec![];
+            for item in page.events_before.into_iter().rev() {
+                append_context(&event.room_id, &item, &mut history)?;
+            }
+            if let Some(reply) = &event.reply_to
+                && !history.iter().any(|e| &e.event_id == reply)
+            {
+                let reply_id: ruma::OwnedEventId = reply.parse()?;
+                let target = room.event(&reply_id, None).await?;
+                append_context(&event.room_id, &target, &mut history)?;
+            }
+            Ok(history)
+        }
+    }
+
+    pub async fn ingest_live_batch(
+        &self,
+        runner: &mut Runner,
+        batch: Batch,
+        now: i64,
+    ) -> Result<()> {
+        for (id, snapshot) in &batch.snapshots {
+            runner.reconcile_room(id, snapshot, now).await?;
+        }
+        for (event, snapshot) in &batch.events {
+            let context = if runner.bridge.needs_context(event, snapshot)? {
+                Some(self.context_for(event).await?)
+            } else {
+                None
+            };
+            runner
+                .ingest_with_context(event, snapshot, context.as_deref(), now)
+                .await?;
+        }
+        runner
+            .bridge
+            .store
+            .checkpoint_sync_with_anchors(&batch.next_token, &batch.anchors)?;
+        Ok(())
+    }
+
     pub async fn deliver(&self, runner: &mut Runner) -> Result<usize> {
         let mut count = 0;
         for message in runner.bridge.store.pending()? {
@@ -297,6 +392,17 @@ impl MatrixAdapter {
         }
         Ok(count)
     }
+}
+
+fn append_context(room: &str, event: &TimelineEvent, history: &mut Vec<Incoming>) -> Result<()> {
+    ensure!(
+        !matches!(event.kind, TimelineEventKind::UnableToDecrypt { .. }),
+        "conversation context contains an undecryptable event; retain the request for key recovery"
+    );
+    if let Some(message) = decode(room, event)? {
+        history.push(message);
+    }
+    Ok(())
 }
 
 /// Recover only a provably continuous gap. A missing anchor or a large history
@@ -367,6 +473,17 @@ pub async fn room_snapshot(room: &Room) -> Result<RoomSnapshot> {
     })
 }
 
+/// Explicit account trust never accepts an unknown or contradictory key origin.
+pub fn account_device_is_known(state: &VerificationState) -> bool {
+    matches!(
+        state,
+        VerificationState::Verified
+            | VerificationState::Unverified(
+                VerificationLevel::UnverifiedIdentity | VerificationLevel::UnsignedDevice
+            )
+    )
+}
+
 pub fn decode(room_id: &str, event: &TimelineEvent) -> Result<Option<Incoming>> {
     let Some(info) = event.encryption_info() else {
         return Ok(None);
@@ -403,6 +520,9 @@ pub fn decode(room_id: &str, event: &TimelineEvent) -> Result<Option<Incoming>> 
             .map(|m| m.user_ids.into_iter().map(|id| id.to_string()).collect())
             .unwrap_or_default(),
         encrypted: true,
+        known_sender_device: account_device_is_known(&info.verification_state)
+            && info.sender == message.sender
+            && info.forwarder.is_none(),
         verified_device: info.verification_state == VerificationState::Verified
             && info.sender == message.sender,
     }))

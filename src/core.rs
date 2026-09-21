@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 use rusqlite::{OptionalExtension, params};
 
 use crate::{
-    config::{Config, ConversationMode, digest},
+    config::{Config, ConversationMode, OperatorTrust, ToolApproval, digest},
     model::*,
     store::{Store, enqueue, enqueue_reaction},
 };
@@ -19,18 +19,19 @@ impl Bridge {
         Ok(Self { config, store })
     }
 
-    fn authorized(&self, event: &Incoming, room: &RoomSnapshot) -> bool {
+    pub fn authorized(&self, event: &Incoming, room: &RoomSnapshot) -> bool {
         let Some(policy) = self.config.room(&event.room_id) else {
             return false;
         };
         event.encrypted
-            && event.verified_device
+            && (event.verified_device
+                || (event.known_sender_device && policy.operator_trust == OperatorTrust::Account))
             && room.joined
             && room.encrypted
             && policy.operators.contains(&event.sender)
             && room.members.contains(&event.sender)
             && room.members.contains(&self.config.bot_user_id)
-            && room.members.is_subset(&policy.audience)
+            && policy.permits_members(&room.members)
             && event.sender != self.config.bot_user_id
     }
 
@@ -59,13 +60,21 @@ impl Bridge {
         }
     }
 
-    pub fn handle(&mut self, event: &Incoming, room: &RoomSnapshot, now: i64) -> Result<Handled> {
+    fn admission(
+        &self,
+        event: &Incoming,
+        room: &RoomSnapshot,
+    ) -> Result<Result<Conversation, Disposition>> {
         if !self.authorized(event, room) {
-            return Ok(Handled::new(Disposition::Denied));
+            return Ok(Err(Disposition::Denied));
         }
         let conversation = self.conversation(event);
-        let policy_hash = self.config.fingerprint();
-        let audience_hash = digest(&serde_json::to_vec(&room.members)?);
+        let policy_hash = self.config.binding_fingerprint(&event.room_id);
+        let audience_hash = self
+            .config
+            .room(&event.room_id)
+            .expect("admitted room")
+            .audience_binding(&room.members);
         let binding: Option<(String, String)> = self
             .store
             .db
@@ -80,7 +89,7 @@ impl Bridge {
             .as_ref()
             .is_some_and(|(p, a)| p != &policy_hash || a != &audience_hash)
         {
-            return Ok(Handled::new(Disposition::Denied));
+            return Ok(Err(Disposition::Denied));
         }
         let reply_to_bot = if let Some(reply) = &event.reply_to {
             self.store.db.query_row(
@@ -98,12 +107,59 @@ impl Bridge {
             && !in_bound_thread
             && !reply_to_bot
         {
-            return Ok(Handled::new(Disposition::Ignored));
+            return Ok(Err(Disposition::Ignored));
         }
         // Commands cannot create a conversation or discover unrelated stored sessions.
         if command && binding.is_none() {
-            return Ok(Handled::new(Disposition::Ignored));
+            return Ok(Err(Disposition::Ignored));
         }
+
+        Ok(Ok(conversation))
+    }
+
+    /// Fetch history only for a new, authorized work request, never for a reader's trigger.
+    pub fn needs_context(&self, event: &Incoming, room: &RoomSnapshot) -> Result<bool> {
+        if event.body.trim().starts_with("!bridge ") {
+            return Ok(false);
+        }
+        let Ok(conversation) = self.admission(event, room)? else {
+            return Ok(false);
+        };
+        let seen: bool = self.store.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM inbox WHERE room=?1 AND event=?2)",
+            params![event.room_id, event.event_id],
+            |r| r.get(0),
+        )?;
+        Ok(!seen && self.store.active_run(&conversation.key)?.is_none())
+    }
+
+    pub fn handle(&mut self, event: &Incoming, room: &RoomSnapshot, now: i64) -> Result<Handled> {
+        self.handle_with_context(event, room, None, now)
+    }
+
+    pub fn handle_with_context(
+        &mut self,
+        event: &Incoming,
+        room: &RoomSnapshot,
+        context: Option<&[Incoming]>,
+        now: i64,
+    ) -> Result<Handled> {
+        let conversation = match self.admission(event, room)? {
+            Ok(conversation) => conversation,
+            Err(disposition) => return Ok(Handled::new(disposition)),
+        };
+        let policy_hash = self.config.binding_fingerprint(&event.room_id);
+        let audience_hash = self
+            .config
+            .room(&event.room_id)
+            .expect("admitted room")
+            .audience_binding(&room.members);
+        let command = event.body.trim().starts_with("!bridge ");
+        let prompt = if let Some(context) = context {
+            crate::context::prompt(&self.config, event, context)?
+        } else {
+            event.body.clone()
+        };
 
         let tx = self.store.db.transaction()?;
         if tx.execute(
@@ -141,6 +197,30 @@ impl Bridge {
                     } else {
                         enqueue(&tx, &conversation.key, "No active run.", now)?;
                     }
+                }
+                ["!bridge", "allow-thread"] => {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO conversation_permissions VALUES(?1,1)",
+                        [&conversation.key],
+                    )?;
+                    enqueue(
+                        &tx,
+                        &conversation.key,
+                        "Tool requests are now approved automatically in this conversation, including the pending request. The worker's configured access and ACP mode still apply. Use !bridge approvals manual to turn this off.",
+                        now,
+                    )?;
+                }
+                ["!bridge", "approvals", "manual"] => {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO conversation_permissions VALUES(?1,0)",
+                        [&conversation.key],
+                    )?;
+                    enqueue(
+                        &tx,
+                        &conversation.key,
+                        "Individual tool approvals restored for this conversation.",
+                        now,
+                    )?;
                 }
                 ["!bridge", "approve", request_id, option_id] => {
                     let permission: Option<(String,String,i64,bool)> = tx.query_row("SELECT a.run,a.options,a.expires,a.consumed FROM approvals a JOIN runs r ON r.id=a.run WHERE a.id=?1 AND r.conversation=?2 AND r.status='waiting_approval'", params![request_id,conversation.key], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
@@ -192,7 +272,7 @@ impl Bridge {
                     enqueue(
                         &tx,
                         &conversation.key,
-                        "Commands: !bridge status; !bridge stop; !bridge approve <request-id> <offered-option-id>.",
+                        "Commands: !bridge status; !bridge stop; !bridge allow-thread; !bridge approvals manual; !bridge approve <request-id> <offered-option-id>.",
                         now,
                     )?;
                 }
@@ -221,7 +301,7 @@ impl Bridge {
                 return Ok(Handled::new(Disposition::Accepted));
             }
             let id = uuid::Uuid::new_v4().to_string();
-            tx.execute("INSERT INTO runs(id,conversation,prompt,status,created) VALUES(?1,?2,?3,'queued',?4)", params![id,conversation.key,event.body,now])?;
+            tx.execute("INSERT INTO runs(id,conversation,prompt,status,created) VALUES(?1,?2,?3,'queued',?4)", params![id,conversation.key,prompt,now])?;
             tx.execute(
                 "INSERT INTO run_inputs(run,event) VALUES(?1,?2)",
                 params![id, event.event_id],
@@ -266,6 +346,7 @@ impl Bridge {
         if run.status == RunStatus::Cancelling && !matches!(event, AgentEvent::Finished { .. }) {
             return Ok(());
         }
+        let automatic = self.automatic_tools(&run.conversation)?;
         let tx = self.store.db.transaction()?;
         match event {
             AgentEvent::SessionReady { session_id, .. } => {
@@ -326,6 +407,10 @@ impl Bridge {
                         "UPDATE runs SET status='waiting_approval' WHERE id=?1",
                         [&run.id],
                     )?;
+                    if automatic && allow_option(&options).is_some() {
+                        tx.commit()?;
+                        return Ok(());
+                    }
                     let choices = options
                         .iter()
                         .map(|o| format!("{}: {} ({})", o.id, o.label, o.kind))
@@ -335,7 +420,7 @@ impl Bridge {
                         &tx,
                         &run.conversation.key,
                         &format!(
-                            "Approval requested: {title}\n{choices}\nReply in this conversation: !bridge approve {request_id} <option-id>\nExpires in {} seconds.",
+                            "Approval requested: {title}\n{choices}\nReply in this conversation: !bridge approve {request_id} <option-id>\nOr approve tools for this conversation: !bridge allow-thread\nExpires in {} seconds.",
                             self.config.approval_ttl_seconds
                         ),
                         now,
@@ -370,6 +455,65 @@ impl Bridge {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    fn automatic_tools(&self, conversation: &Conversation) -> Result<bool> {
+        let override_policy: Option<bool> = self
+            .store
+            .db
+            .query_row(
+                "SELECT automatic FROM conversation_permissions WHERE conversation=?1",
+                [&conversation.key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(override_policy.unwrap_or_else(|| {
+            self.config
+                .room(&conversation.room_id)
+                .is_some_and(|p| p.tool_approval == ToolApproval::Automatic)
+        }))
+    }
+
+    /// Decisions are journaled before delivery. Never invent an option or allow
+    /// an expired, cancelled or policy-invalid run to acquire a permission.
+    pub fn automatic_approvals(&mut self, now: i64) -> Result<Vec<Effect>> {
+        let pending: Vec<(String, String, String)> = {
+            let mut stmt = self.store.db.prepare("SELECT a.id,a.run,a.options FROM approvals a JOIN runs r ON r.id=a.run WHERE a.consumed=0 AND a.expires>?1 AND r.status='waiting_approval'")?;
+            stmt.query_map([now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut effects = vec![];
+        for (request_id, run_id, raw) in pending {
+            let run = self.store.run(&run_id)?.expect("queried run exists");
+            let policy: String = self.store.db.query_row(
+                "SELECT policy FROM conversations WHERE key=?1",
+                [&run.conversation.key],
+                |r| r.get(0),
+            )?;
+            if policy != self.config.binding_fingerprint(&run.conversation.room_id)
+                || !self.automatic_tools(&run.conversation)?
+            {
+                continue;
+            }
+            let options: Vec<PermissionOption> = serde_json::from_str(&raw)?;
+            let Some(option_id) = allow_option(&options) else {
+                continue;
+            };
+            let tx = self.store.db.transaction()?;
+            tx.execute("UPDATE approvals SET consumed=1 WHERE id=?1", [&request_id])?;
+            tx.execute(
+                "INSERT INTO approval_decisions VALUES(?1,?2,'automatic')",
+                params![request_id, option_id],
+            )?;
+            tx.execute("UPDATE runs SET status='running' WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM approvals WHERE run=?1 AND consumed=0)", [&run_id])?;
+            tx.commit()?;
+            effects.push(Effect::Decide {
+                run_id,
+                request_id,
+                option_id: Some(option_id),
+            });
+        }
+        Ok(effects)
     }
 
     pub fn flush_progress(&mut self, now: i64) -> Result<()> {
@@ -432,12 +576,12 @@ impl Bridge {
         Ok(snapshot.joined
             && snapshot.encrypted
             && snapshot.members.contains(&self.config.bot_user_id)
-            && snapshot.members.is_subset(&policy.audience)
+            && policy.permits_members(&snapshot.members)
             && expected.is_some_and(|(p, a)| {
-                p == self.config.fingerprint()
-                    && a == digest(
-                        &serde_json::to_vec(&snapshot.members).expect("members serialize"),
-                    )
+                p == self
+                    .config
+                    .binding_fingerprint(&message.conversation.room_id)
+                    && a == policy.audience_binding(&snapshot.members)
             }))
     }
 
@@ -487,4 +631,11 @@ fn flush_run(db: &rusqlite::Connection, run: &Run, now: i64) -> Result<()> {
     }
     db.execute("DELETE FROM output WHERE run=?1", [&run.id])?;
     Ok(())
+}
+
+fn allow_option(options: &[PermissionOption]) -> Option<String> {
+    options
+        .iter()
+        .find(|o| o.kind == "allow_once")
+        .map(|o| o.id.clone())
 }

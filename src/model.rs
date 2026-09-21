@@ -15,6 +15,9 @@ pub struct Incoming {
     pub mentions: BTreeSet<String>,
     pub encrypted: bool,
     pub verified_device: bool,
+    /// SDK linked this message to a known sender device without a trust violation.
+    /// This is account/device-list trust, not independently verified identity.
+    pub known_sender_device: bool,
 }
 
 #[derive(Clone, Debug)]

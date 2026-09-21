@@ -24,15 +24,17 @@ The Matrix and ACP SDKs own their wire protocols. The bridge owns the meaning of
 
 One configured Matrix account owns one journal and worker profile. Give each human's agent its own account, runtime credentials and state. Multiple profiles do not create isolation if their processes share access to the same files or credentials.
 
-The policy checks exact Matrix user and room IDs, joined membership, configured audience, E2EE and verified sending devices. A room's membership defines its audience; threads do not change that audience. Mentions are triggers. Approval, stop and status messages pass the same checks as work requests.
+The policy checks exact Matrix user and room IDs, joined membership, configured audience, E2EE and the configured sender-trust policy (account/device-list trust or independently verified identities). A room's membership defines its audience; threads do not change that audience. Mentions are triggers. Approval, stop and status messages pass the same checks as work requests.
 
-Bindings include bot ID, room ID, room-or-thread key, a hash of the configuration, and a hash of the current joined audience. Any binding mismatch blocks reuse and delivery. Start a new conversation after a deliberate policy change; migration/reset tooling is not yet implemented. In room mode, such changes need an explicit administrative migration before resuming that room's existing binding.
+Bindings include bot ID, room ID and room-or-thread key. Configured-audience mode also binds the entire configuration and current joined roster. Room-membership mode instead binds the bot/homeserver, harness/workspace/credentials and conversation mode; operator lists and membership apply dynamically without resetting sessions. A worker-runtime binding mismatch still blocks reuse/delivery until an explicit new conversation or administrative migration.
 
 The roster check cannot retract already delivered plaintext, old keys or files read by a model. Room membership changes have unavoidable network/in-flight races. Each room's authorized audience must be permitted to see the data accessible to that worker. System prompts are not a confidentiality boundary.
 
 ## Delivery and crash behavior
 
-Inbound event identity and run creation are recorded in one transaction. A partial unique index prevents concurrent runs in one conversation. Approval choice consumption is transactional and scoped to the active run/conversation; invalid choices do not consume it. Cancellation enters a distinct state and rejects later permission/output events until the worker settles.
+Inbound event identity and run creation are recorded in one transaction. A partial unique index prevents concurrent runs in one conversation. Context is fetched with the SDK before admitting work. Thread relations are paginated in forward order from the root through the triggering event; later messages and unrelated threads are not included. Missing/decryption-failed context retains the staged request rather than invoking an agent without its parent. The prompt identifies Matrix, attributes each message and separates history from the authorized instruction.
+
+Approval choice consumption is transactional and scoped to the active run/conversation; invalid choices do not consume it. Cancellation enters a distinct state and rejects later permission/output events until the worker settles.
 
 The Matrix adapter first fetches the raw `/sync` response using the official client request API and stages permitted-room wire events in the application journal. It then performs a zero-wait SDK sync from the same cursor for SDK-owned room/key processing and decrypts the staged events with the SDK. This extra sync request is intentional: the SDK suppresses a repeated `next_batch`, so relying only on its processed response leaves a crash window. Application checkpoint and staged-batch removal are atomic after durable event admission.
 
@@ -46,7 +48,7 @@ The journal contains decrypted prompts and output; private directory permissions
 
 The client uses stable protocol-v1 entrypoints and advertised capabilities. It loads a stored session when supported, otherwise uses advertised resume support, otherwise refuses to pretend context survived. It requires an advertised permission mode and an acknowledged mode-setting request before the prompt. Client-provided filesystem and terminal capabilities remain disabled.
 
-Permission callbacks release the SDK dispatch loop while waiting for a human. Blocking that loop would prevent cancellation and other incoming traffic. Responses preserve actual offered option IDs; unknown choices never become approval. A cancellation request also closes approval admission.
+Permission callbacks release the SDK dispatch loop while waiting for a human. Blocking that loop would prevent cancellation and other incoming traffic. Responses preserve actual offered option IDs; unknown choices never become approval. An explicit room or conversation policy can consume an offered allow_once choice automatically, with a durable decision record. No persistent backend permission is selected automatically. A cancellation request also closes approval admission.
 
 Normal model turns have no artificial duration or output-token cap. Initialization/session/mode handshakes have 30-second deadlines. Explicit cancellation has a five-second grace period, after which the run is marked interrupted and the transport closes. The subprocess transport clears inherited environment variables and owns a Unix process group. It provides lifecycle hygiene, not a sandbox.
 

@@ -37,6 +37,9 @@ enum Commands {
     Check {
         #[arg(long, default_value = "config.toml")]
         config: PathBuf,
+        /// Print effective access policy and binding hashes, never environment secrets.
+        #[arg(long)]
+        json: bool,
     },
     /// Exercise the real ACP SDK against an in-memory deterministic fixture.
     Demo {
@@ -58,6 +61,13 @@ enum Commands {
     /// Inspect one encrypted event in the single configured room.
     #[cfg(feature = "matrix")]
     InspectEvent {
+        #[arg(long, default_value = "config.toml")]
+        config: PathBuf,
+        event_id: String,
+    },
+    /// Check fetched thread context without printing message bodies or running an agent.
+    #[cfg(feature = "matrix")]
+    InspectContext {
         #[arg(long, default_value = "config.toml")]
         config: PathBuf,
         event_id: String,
@@ -120,8 +130,25 @@ async fn main() -> Result<()> {
             );
             println!("Configured mode applied. No prompt was sent; no Matrix connection was made.");
         }
-        Commands::Check { config } => {
+        Commands::Check { config, json } => {
             let config = Config::parse(&std::fs::read_to_string(config)?)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "config_fingerprint":config.fingerprint(),
+                        "max_concurrent_runs":config.max_concurrent_runs,
+                        "approval_ttl_seconds":config.approval_ttl_seconds,
+                        "harness_mode":config.harness.mode,
+                        "rooms":config.rooms.iter().map(|r|serde_json::json!({
+                            "room_id":r.room_id,"binding":config.binding_fingerprint(&r.room_id),
+                            "operators":r.operators,"operator_trust":r.operator_trust,
+                            "audience_policy":r.audience_policy,"tool_approval":r.tool_approval,
+                        })).collect::<Vec<_>>()
+                    })
+                );
+                return Ok(());
+            }
             println!(
                 "Configuration valid: {} room(s), {} concurrent run(s). No connections or agents started.",
                 config.rooms.len(),
@@ -143,6 +170,11 @@ async fn main() -> Result<()> {
         Commands::InspectEvent { config, event_id } => {
             let config = Config::parse(&std::fs::read_to_string(config)?)?;
             matrix_acp_bridge::live::inspect_event(config, &event_id).await?;
+        }
+        #[cfg(feature = "matrix")]
+        Commands::InspectContext { config, event_id } => {
+            let config = Config::parse(&std::fs::read_to_string(config)?)?;
+            matrix_acp_bridge::live::inspect_context(config, &event_id).await?;
         }
         #[cfg(feature = "matrix")]
         Commands::Verify { config, user_id } => {
@@ -181,6 +213,7 @@ async fn demo(scenario: Scenario) -> Result<()> {
         mentions: BTreeSet::from([config.bot_user_id.clone()]),
         encrypted: true,
         verified_device: true,
+        known_sender_device: true,
     };
     let store = Store::memory(&config.bot_user_id)?;
     let bridge = Bridge::new(config.clone(), store)?;
