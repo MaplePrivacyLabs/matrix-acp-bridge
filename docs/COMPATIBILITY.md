@@ -27,7 +27,7 @@ Run `doctor` before Matrix enrollment. It checks initialization, session creatio
 
 **Live-tested:** Codex ACP 1.12.0 with Codex CLI 0.154.0 on Linux, using ChatGPT authentication and ACP modes `agent` and `agent-full-access`. Its [upstream instructions](https://github.com/agentclientprotocol/codex-acp) cover installation and authentication. The bridge also supports other modes the adapter advertises; `doctor` lists them. Pin adapter versions for repeatable deployments and recheck after upgrades.
 
-**Not yet live-tested here:** other ACP implementations. Contributions should record the adapter version, launch arguments, modes, authentication method (never credentials), new session, resumed follow-up, permission denial, and cancellation. Approval/cancellation currently have protocol-fixture coverage; the first live test covered mention, answer and resumed follow-up.
+**Not yet live-tested here:** other ACP implementations. Contributions should record the adapter version, launch arguments, modes, authentication method (never credentials), new session, resumed follow-up, permission denial, and cancellation. Live checks also exercised automatic thread context, room/sender/date-filtered search, pagination, complete-thread retrieval, an encrypted image returned through MCP, and cancel-and-resume steering during a running shell tool in one Codex session. Permission-choice edge cases have protocol-fixture coverage. Other adapters and image interpretation by every model remain unverified.
 
 ## Platforms and workspaces
 
