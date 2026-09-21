@@ -1,0 +1,48 @@
+[package]
+name = "matrix-acp-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+license = "MIT"
+repository = "https://github.com/MaplePrivacyLabs/matrix-acp-bridge"
+readme = "README.md"
+description = "Matrix conversations for isolated ACP agent workers"
+
+[features]
+default = []
+matrix = ["dep:matrix-sdk", "dep:matrix-sdk-crypto", "dep:matrix-sdk-sqlite"]
+
+[dependencies]
+agent-client-protocol = "=2.2.0"
+anyhow = "1"
+async-process = "2"
+clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
+futures = "0.3"
+matrix-sdk = { version = "=0.19.1", optional = true, default-features = false, features = ["e2e-encryption", "sqlite", "rustls-aws-lc-rs"] }
+matrix-sdk-crypto = { version = "=0.19.1", optional = true }
+matrix-sdk-sqlite = { version = "=0.19.1", optional = true, default-features = false, features = ["crypto-store"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rpassword = "7"
+rustix = { version = "1", features = ["process"] }
+ruma = { version = "0.17", features = ["events"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "io-util", "signal"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+toml = "0.9"
+uuid = { version = "1", features = ["v4", "serde"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"

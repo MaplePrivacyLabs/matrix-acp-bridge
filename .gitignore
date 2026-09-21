@@ -1,0 +1,12 @@
+/target/
+/.local/
+/state/
+*.sqlite*
+*.db*
+.env
+*.local.toml
+
+/config.toml
+*.pem
+*.key
+.DS_Store

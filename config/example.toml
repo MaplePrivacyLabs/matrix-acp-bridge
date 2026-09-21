@@ -1,0 +1,24 @@
+# Placeholder identities only. Run `matrix-acp-bridge init` to create your own config.
+bot_user_id = "@engineering-agent:example.invalid"
+homeserver = "https://matrix.example.invalid"
+state_dir = "/isolated-worker/state/matrix-acp-bridge"
+approval_ttl_seconds = 300
+max_concurrent_runs = 1
+
+[harness]
+program = "/isolated-worker/bin/codex-acp"
+args = []
+workspace = "/isolated-worker/workspaces/project"
+mode = "read-only" # Must be a mode advertised by your adapter; run `doctor`.
+
+# Only explicitly listed environment variables reach a future child process.
+# This does not isolate files or credentials from another process with the same UID.
+[harness.env]
+HOME = "/isolated-worker/home/agent"
+PATH = "/isolated-worker/bin:/usr/bin:/bin"
+
+[[rooms]]
+room_id = "!engineering:example.invalid"
+operators = ["@owner:example.invalid"]
+audience = ["@owner:example.invalid", "@engineering-agent:example.invalid"]
+conversation = "thread"
