@@ -19,6 +19,9 @@ pub struct Config {
     pub approval_ttl_seconds: u64,
     #[serde(default = "default_concurrency")]
     pub max_concurrent_runs: usize,
+    /// Optional shared socket path when bridge and agent have different OS users.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_socket: Option<PathBuf>,
 }
 
 fn default_approval_ttl() -> u64 {
@@ -170,8 +173,12 @@ impl Config {
             "approval TTL must be 1 to 3600 seconds"
         );
         ensure!(
-            (1..=64).contains(&self.max_concurrent_runs),
-            "worker concurrency must be 1 to 64"
+            self.max_concurrent_runs <= 64,
+            "worker concurrency must be 0 (unlimited) to 64"
+        );
+        ensure!(
+            self.tools_socket.as_ref().is_none_or(|p| p.is_absolute()),
+            "tools socket must be absolute"
         );
         let mut rooms = BTreeSet::new();
         for room in &self.rooms {
@@ -206,6 +213,12 @@ impl Config {
             );
         }
         Ok(())
+    }
+
+    pub fn tools_socket_path(&self) -> PathBuf {
+        self.tools_socket
+            .clone()
+            .unwrap_or_else(|| self.state_dir.join("tools.sock"))
     }
 
     /// Binding identity includes credential configuration, but never stores its plaintext.

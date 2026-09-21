@@ -308,3 +308,49 @@ fn room_membership_accepts_new_readers_without_reset_but_keeps_operator_gate() {
         Disposition::Denied
     );
 }
+
+#[test]
+fn attachments_are_addressable_without_leaking_encryption_keys_into_prompts() {
+    let mut request = message("attachment", "explain this image", None);
+    request.attachment = Some(Attachment {
+        name: "diagram.png".into(),
+        mime_type: "image/png".into(),
+        source: serde_json::json!({"file":{"key":{"k":"fixture-key-not-prompt-data"}}}),
+    });
+    let prompt = context::prompt(&config(), &request, &[]).unwrap();
+    assert!(prompt.contains("matrix_attachment"));
+    assert!(prompt.contains("diagram.png"));
+    assert!(prompt.contains(&request.event_id));
+    assert!(!prompt.contains("fixture-key-not-prompt-data"));
+}
+
+#[test]
+fn automatic_tools_accept_backend_with_only_persistent_allow_choice() {
+    let mut bridge = bridge();
+    bridge.config.rooms[0].tool_approval = ToolApproval::Automatic;
+    let run_id = start(&mut bridge, "one");
+    bridge
+        .agent_event(
+            AgentEvent::Permission {
+                run_id,
+                request_id: "only-persistent".into(),
+                title: "Tool".into(),
+                options: vec![
+                    PermissionOption {
+                        id: "deny".into(),
+                        label: "Deny".into(),
+                        kind: "reject_once".into(),
+                    },
+                    PermissionOption {
+                        id: "permit".into(),
+                        label: "Allow".into(),
+                        kind: "allow_always".into(),
+                    },
+                ],
+            },
+            101,
+        )
+        .unwrap();
+    let choices = bridge.automatic_approvals(102).unwrap();
+    assert!(matches!(choices.as_slice(),[Effect::Decide {option_id:Some(id),..}] if id=="permit"));
+}

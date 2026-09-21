@@ -19,6 +19,7 @@ pub type TransportFactory = Arc<dyn Fn(&HarnessConfig) -> DynConnectTo<Client> +
 pub struct Runner {
     pub bridge: Bridge,
     factory: TransportFactory,
+    mcp_servers: Vec<agent_client_protocol::schema::v1::McpServer>,
     controls: BTreeMap<String, mpsc::Sender<Command>>,
     tasks: tokio::task::JoinSet<()>,
     updates: mpsc::Sender<AgentEvent>,
@@ -32,6 +33,7 @@ impl Runner {
         Self {
             bridge,
             factory,
+            mcp_servers: vec![],
             controls: BTreeMap::new(),
             tasks: tokio::task::JoinSet::new(),
             updates,
@@ -43,6 +45,14 @@ impl Runner {
                     .as_secs() as i64
             }),
         }
+    }
+
+    pub fn with_mcp_servers(
+        mut self,
+        servers: Vec<agent_client_protocol::schema::v1::McpServer>,
+    ) -> Self {
+        self.mcp_servers = servers;
+        self
     }
 
     /// Deterministic clocks for offline fixtures; production uses wall time on arrival.
@@ -67,6 +77,7 @@ impl Runner {
         context: Option<&[Incoming]>,
         now: i64,
     ) -> Result<Handled> {
+        while self.try_update()?.is_some() {}
         self.reconcile_room(&event.room_id, room, now).await?;
         let handled = self.bridge.handle_with_context(event, room, context, now)?;
         self.apply(&handled.effects, now).await?;
@@ -80,6 +91,7 @@ impl Runner {
                     let run = self.bridge.started(run_id)?;
                     let harness = self.bridge.config.harness.clone();
                     let transport = (self.factory)(&harness);
+                    let mcp_servers = self.mcp_servers.clone();
                     let (send, receive) = mpsc::channel(32);
                     self.controls.insert(run_id.clone(), send);
                     let updates = self.updates.clone();
@@ -88,7 +100,13 @@ impl Runner {
                     let ttl = Duration::from_secs(self.bridge.config.approval_ttl_seconds);
                     self.tasks.spawn(async move {
                         let result = std::panic::AssertUnwindSafe(acp::execute(
-                            transport, harness, run, ttl, receive, updates,
+                            transport,
+                            harness,
+                            run,
+                            mcp_servers,
+                            ttl,
+                            receive,
+                            updates,
                         ))
                         .catch_unwind()
                         .await;
@@ -115,6 +133,21 @@ impl Runner {
                             },
                             now,
                         )?;
+                    }
+                }
+                Effect::Steer {
+                    run_id,
+                    event_id,
+                    prompt,
+                } => {
+                    if let Some(control) = self.controls.get(run_id) {
+                        // A terminal-turn race is recovered from the durable steer row.
+                        let _ = control
+                            .send(Command::Steer {
+                                event_id: event_id.clone(),
+                                prompt: prompt.clone(),
+                            })
+                            .await;
                     }
                 }
                 Effect::Decide {
@@ -168,6 +201,8 @@ impl Runner {
 
     pub async fn tick(&mut self, now: i64) -> Result<()> {
         let effects = self.bridge.expire_approvals(now)?;
+        self.apply(&effects, now).await?;
+        let effects = self.bridge.resume_pending_steers(now)?;
         self.apply(&effects, now).await?;
         let effects = self.bridge.automatic_approvals(now)?;
         self.apply(&effects, now).await?;

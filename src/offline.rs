@@ -11,6 +11,7 @@ pub enum Behavior {
     Reply,
     Approval,
     WaitForCancel,
+    SteerThenReply,
     RejectMode,
     WrongSession,
     ChangeMode,
@@ -84,7 +85,7 @@ impl FixtureAgent {
                 let text = request.prompt.iter().filter_map(|block|match block {ContentBlock::Text(t)=>Some(t.text.as_str()),_=>None}).collect::<Vec<_>>().join("\n");
                 obs_prompt.lock().expect("fixture lock").prompts.push(text.clone());
                 let session = request.session_id.clone();
-                if matches!(behavior,Behavior::WaitForCancel) {
+                if matches!(behavior,Behavior::WaitForCancel) || (matches!(behavior,Behavior::SteerThenReply) && obs_prompt.lock().expect("fixture lock").prompts.len() == 1) {
                     cancel_prompt.notified().await;
                     return responder.respond(PromptResponse::new(StopReason::Cancelled));
                 }

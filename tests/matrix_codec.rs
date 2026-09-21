@@ -317,3 +317,54 @@ async fn replies_reach_unverified_readers_but_blocked_devices_stay_excluded() {
             .any(|r| r.event_type.to_string() == "m.room_key.withheld")
     );
 }
+
+#[tokio::test]
+async fn encrypted_image_and_file_messages_retain_download_descriptors() {
+    let user = user_id!("@owner:example.invalid");
+    let room = room_id!("!engineering:example.invalid");
+    let machine = OlmMachine::new(user, device_id!("ATTACHMENT_FIXTURE")).await;
+    machine
+        .share_room_key(
+            room,
+            std::iter::empty::<&ruma::UserId>(),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    for (kind, mime, name) in [
+        ("m.image", "image/png", "diagram.png"),
+        ("m.file", "text/plain", "notes.txt"),
+    ] {
+        let content = serde_json::from_value(json!({
+            "msgtype":kind,"body":name,"url":"mxc://example.invalid/fixture",
+            "info":{"mimetype":mime},
+            "m.relates_to":{"rel_type":"m.thread","event_id":"$parent","is_falling_back":true,"m.in_reply_to":{"event_id":"$parent"}}
+        })).unwrap();
+        let encrypted = machine
+            .encrypt_room_event(room, AnyMessageLikeEventContent::RoomMessage(content))
+            .await
+            .unwrap();
+        let raw = Raw::from_json_string(json!({"event_id":"$attachment","origin_server_ts":1,"sender":user,"type":"m.room.encrypted","content":encrypted.content}).to_string()).unwrap();
+        let decrypted = machine
+            .decrypt_room_event(
+                &raw,
+                room,
+                &DecryptionSettings {
+                    sender_device_trust_requirement: TrustRequirement::Untrusted,
+                },
+            )
+            .await
+            .unwrap();
+        let incoming = decode(
+            room.as_str(),
+            &TimelineEvent::from_decrypted(decrypted, None),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(incoming.thread_root.as_deref(), Some("$parent"));
+        let attachment = incoming.attachment.unwrap();
+        assert_eq!(attachment.name, name);
+        assert_eq!(attachment.mime_type, mime);
+        assert_eq!(attachment.source["url"], "mxc://example.invalid/fixture");
+    }
+}

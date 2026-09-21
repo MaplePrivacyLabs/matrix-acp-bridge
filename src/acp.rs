@@ -24,6 +24,10 @@ use crate::{
 #[derive(Debug)]
 pub enum Command {
     Cancel,
+    Steer {
+        event_id: String,
+        prompt: String,
+    },
     Decide {
         request_id: String,
         option_id: Option<String>,
@@ -124,12 +128,13 @@ pub async fn inspect(
         .map_err(Into::into)
 }
 
-/// Run exactly one turn, resuming the stored session if present. Model turns have
+/// Run a conversation, resuming the stored session and accepting steering. Model turns have
 /// no hidden time/token limit. Handshakes and requested cancellation have deadlines.
 pub async fn execute(
     transport: impl ConnectTo<Client>,
     harness: HarnessConfig,
     run: Run,
+    mcp_servers: Vec<McpServer>,
     approval_ttl: Duration,
     mut commands: mpsc::Receiver<Command>,
     updates: mpsc::Sender<AgentEvent>,
@@ -210,13 +215,13 @@ pub async fn execute(
             if init.protocol_version != ProtocolVersion::V1 { return Err(error("agent selected an unsupported protocol")); }
             let (session_id,modes) = if let Some(id) = run.session_id {
                 let modes=if init.agent_capabilities.load_session {
-                    tokio::time::timeout(Duration::from_secs(30), connection.send_request(LoadSessionRequest::new(id.clone(),harness.workspace.clone())).block_task()).await.map_err(|_|error("ACP load timed out"))??.modes
+                    tokio::time::timeout(Duration::from_secs(30), connection.send_request(LoadSessionRequest::new(id.clone(),harness.workspace.clone()).mcp_servers(mcp_servers.clone())).block_task()).await.map_err(|_|error("ACP load timed out"))??.modes
                 } else if init.agent_capabilities.session_capabilities.resume.is_some() {
-                    tokio::time::timeout(Duration::from_secs(30), connection.send_request(ResumeSessionRequest::new(id.clone(),harness.workspace.clone())).block_task()).await.map_err(|_|error("ACP resume timed out"))??.modes
+                    tokio::time::timeout(Duration::from_secs(30), connection.send_request(ResumeSessionRequest::new(id.clone(),harness.workspace.clone()).mcp_servers(mcp_servers.clone())).block_task()).await.map_err(|_|error("ACP resume timed out"))??.modes
                 } else {return Err(error("agent cannot resume; refusing to silently lose context"));};
                 (SessionId::new(id),modes)
             } else {
-                let created = tokio::time::timeout(Duration::from_secs(30), connection.send_request(NewSessionRequest::new(harness.workspace.clone())).block_task()).await.map_err(|_|error("ACP session creation timed out"))??;
+                let created = tokio::time::timeout(Duration::from_secs(30), connection.send_request(NewSessionRequest::new(harness.workspace.clone()).mcp_servers(mcp_servers.clone())).block_task()).await.map_err(|_|error("ACP session creation timed out"))??;
                 (created.session_id,created.modes)
             };
             let modes = modes.ok_or_else(||error("agent must advertise the required permission mode"))?;
@@ -224,45 +229,68 @@ pub async fn execute(
             tokio::time::timeout(Duration::from_secs(30),connection.send_request(SetSessionModeRequest::new(session_id.clone(),harness.mode)).block_task()).await.map_err(|_|error("ACP mode change timed out"))??;
             *expected_session.lock().expect("session mutex poisoned") = Some(session_id.to_string());
             updates.send(AgentEvent::SessionReady {run_id:run.id.clone(),session_id:session_id.to_string()}).await.map_err(|_|error("controller closed"))?;
-            active.store(true,Ordering::SeqCst);
-            let prompt = connection.send_request(PromptRequest::new(session_id.clone(),vec![ContentBlock::Text(TextContent::new(run.prompt))])).block_task();
-            tokio::pin!(prompt);
-            let mut stopping = false;
+            let mut next_prompt = run.prompt.clone();
             let mut commands_open = true;
-            let stop_deadline = tokio::time::sleep(Duration::from_secs(5));
-            tokio::pin!(stop_deadline);
-            let status = loop {
-                tokio::select! {
-                    response = &mut prompt => {
-                        let response = response?;
-                        break match response.stop_reason {
-                            StopReason::EndTurn => RunStatus::Completed,
-                            StopReason::Cancelled => RunStatus::Cancelled,
-                            _ => RunStatus::Failed,
-                        };
-                    }
-                    _ = mode_fault_rx.recv() => { return Err(error("agent changed the required permission mode during a turn")); }
-                    _ = &mut stop_deadline, if stopping => { break RunStatus::Interrupted; }
-                    command = commands.recv(), if commands_open => match command {
-                        Some(Command::Decide {request_id,option_id}) => {
-                            let mut map = pending.lock().expect("pending mutex poisoned");
-                            if map.get(&request_id).is_some_and(|entry|option_id.as_ref().is_none_or(|id|entry.options.contains(id)))
-                                && let Some(entry) = map.remove(&request_id) {
-                                let _ = entry.answer.send(option_id);
+            let status = 'turns: loop {
+                active.store(true,Ordering::SeqCst);
+                let prompt = connection.send_request(PromptRequest::new(session_id.clone(),vec![ContentBlock::Text(TextContent::new(next_prompt))])).block_task();
+                tokio::pin!(prompt);
+                let mut stopping = false;
+                let mut steering: Vec<(String,String)> = vec![];
+                let stop_deadline = tokio::time::sleep(Duration::from_secs(5));
+                tokio::pin!(stop_deadline);
+                let outcome = loop {
+                    tokio::select! {
+                        response = &mut prompt => {
+                            let response = response?;
+                            break match response.stop_reason {
+                                StopReason::EndTurn => RunStatus::Completed,
+                                StopReason::Cancelled => RunStatus::Cancelled,
+                                _ => RunStatus::Failed,
+                            };
+                        }
+                        _ = mode_fault_rx.recv() => { return Err(error("agent changed the required permission mode during a turn")); }
+                        _ = &mut stop_deadline, if stopping => { break RunStatus::Interrupted; }
+                        command = commands.recv(), if commands_open => match command {
+                            Some(Command::Decide {request_id,option_id}) => {
+                                let mut map = pending.lock().expect("pending mutex poisoned");
+                                if map.get(&request_id).is_some_and(|entry|option_id.as_ref().is_none_or(|id|entry.options.contains(id)))
+                                    && let Some(entry) = map.remove(&request_id) {
+                                    let _ = entry.answer.send(option_id);
+                                }
+                            }
+                            Some(Command::Steer {event_id,prompt}) => {
+                                steering.push((event_id,prompt));
+                                if !stopping {
+                                    stopping = true;
+                                    active.store(false,Ordering::SeqCst);
+                                    stop_deadline.as_mut().reset(tokio::time::Instant::now()+Duration::from_secs(5));
+                                    cancel_pending(&pending);
+                                    connection.send_notification(CancelNotification::new(session_id.clone()))?;
+                                }
+                            }
+                            Some(Command::Cancel) | None => {
+                                steering.clear();
+                                if !stopping {
+                                    stopping = true;
+                                    active.store(false,Ordering::SeqCst);
+                                    stop_deadline.as_mut().reset(tokio::time::Instant::now()+Duration::from_secs(5));
+                                    cancel_pending(&pending);
+                                    connection.send_notification(CancelNotification::new(session_id.clone()))?;
+                                }
+                                if commands.is_closed() { commands_open = false; }
                             }
                         }
-                        Some(Command::Cancel) | None => {
-                            if !stopping {
-                                stopping = true;
-                                active.store(false,Ordering::SeqCst);
-                                stop_deadline.as_mut().reset(tokio::time::Instant::now()+Duration::from_secs(5));
-                                cancel_pending(&pending);
-                                connection.send_notification(CancelNotification::new(session_id.clone()))?;
-                            }
-                            if commands.is_closed() { commands_open = false; }
-                        }
                     }
+                };
+                if !steering.is_empty() && matches!(outcome, RunStatus::Completed | RunStatus::Cancelled) {
+                    next_prompt = steering.iter().map(|(_,p)|p.as_str()).collect::<Vec<_>>().join("\n\nAdditional instruction:\n");
+                    for (event_id,_) in steering {
+                        updates.send(AgentEvent::Steered {run_id:run.id.clone(),event_id}).await.map_err(|_|error("controller closed"))?;
+                    }
+                    continue 'turns;
                 }
+                break outcome;
             };
             active.store(false,Ordering::SeqCst);
             cancel_pending(&pending);
@@ -320,8 +348,8 @@ fn spawn_scoped(harness: &HarnessConfig) -> agent_client_protocol::Result<async_
         .args(&harness.args)
         .env_clear()
         .envs(&harness.env)
-        // The bridge identity cannot enter the agent's private workspace.
-        // The fixed run-as launcher enters it after switching identities.
+        // ACP receives the configured workspace through session/new or session/load.
+        // Starting from / also permits an operator-supplied run-as launcher.
         .current_dir("/");
     #[cfg(unix)]
     {

@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::Config,
-    model::{Incoming, Outbound, RoomSnapshot},
+    model::{Attachment, Incoming, Outbound, RoomSnapshot},
     runner::Runner,
     store::Store,
 };
@@ -36,6 +36,7 @@ use crate::{
 /// The SDK continues to exclude devices explicitly marked as blocked.
 pub const REPLY_KEY_RECIPIENT_STRATEGY: CollectStrategy = CollectStrategy::AllDevices;
 
+#[derive(Clone)]
 pub struct MatrixAdapter {
     client: Client,
     allowed_rooms: BTreeSet<String>,
@@ -494,8 +495,53 @@ pub fn decode(room_id: &str, event: &TimelineEvent) -> Result<Option<Incoming>> 
     else {
         return Ok(None);
     };
-    let MessageType::Text(text) = message.content.msgtype else {
-        return Ok(None);
+    let (body, attachment) = match message.content.msgtype {
+        MessageType::Text(text) => (text.body, None),
+        MessageType::Image(file) => (
+            file.body.clone(),
+            Some(Attachment {
+                name: file.body,
+                mime_type: file
+                    .info
+                    .and_then(|i| i.mimetype)
+                    .unwrap_or_else(|| "image/jpeg".into()),
+                source: serde_json::to_value(file.source)?,
+            }),
+        ),
+        MessageType::File(file) => (
+            file.body.clone(),
+            Some(Attachment {
+                name: file.filename.unwrap_or(file.body),
+                mime_type: file
+                    .info
+                    .and_then(|i| i.mimetype)
+                    .unwrap_or_else(|| "application/octet-stream".into()),
+                source: serde_json::to_value(file.source)?,
+            }),
+        ),
+        MessageType::Audio(file) => (
+            file.body.clone(),
+            Some(Attachment {
+                name: file.body,
+                mime_type: file
+                    .info
+                    .and_then(|i| i.mimetype)
+                    .unwrap_or_else(|| "audio/ogg".into()),
+                source: serde_json::to_value(file.source)?,
+            }),
+        ),
+        MessageType::Video(file) => (
+            file.body.clone(),
+            Some(Attachment {
+                name: file.body,
+                mime_type: file
+                    .info
+                    .and_then(|i| i.mimetype)
+                    .unwrap_or_else(|| "video/mp4".into()),
+                source: serde_json::to_value(file.source)?,
+            }),
+        ),
+        _ => return Ok(None),
     };
     let (thread_root, reply_to) = match message.content.relates_to {
         Some(Relation::Replacement(_)) => return Ok(None),
@@ -511,7 +557,8 @@ pub fn decode(room_id: &str, event: &TimelineEvent) -> Result<Option<Incoming>> 
         event_id: message.event_id.to_string(),
         room_id: room_id.into(),
         sender: message.sender.to_string(),
-        body: text.body,
+        body,
+        attachment,
         thread_root,
         reply_to,
         mentions: message

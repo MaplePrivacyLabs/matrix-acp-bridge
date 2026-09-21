@@ -122,7 +122,7 @@ impl Bridge {
         if event.body.trim().starts_with("!bridge ") {
             return Ok(false);
         }
-        let Ok(conversation) = self.admission(event, room)? else {
+        let Ok(_) = self.admission(event, room)? else {
             return Ok(false);
         };
         let seen: bool = self.store.db.query_row(
@@ -130,7 +130,7 @@ impl Bridge {
             params![event.room_id, event.event_id],
             |r| r.get(0),
         )?;
-        Ok(!seen && self.store.active_run(&conversation.key)?.is_none())
+        Ok(!seen)
     }
 
     pub fn handle(&mut self, event: &Incoming, room: &RoomSnapshot, now: i64) -> Result<Handled> {
@@ -183,9 +183,11 @@ impl Bridge {
                     enqueue(&tx, &conversation.key, &text, now)?;
                 }
                 ["!bridge", "stop"] => {
+                    tx.execute("UPDATE run_steers SET status='cancelled' WHERE status='pending' AND run IN (SELECT id FROM runs WHERE conversation=?1)", [&conversation.key])?;
                     if let Some((run_id, _)) = active {
                         tx.execute("UPDATE runs SET status='cancelling' WHERE id=?1", [&run_id])?;
                         tx.execute("UPDATE approvals SET consumed=1 WHERE run=?1", [&run_id])?;
+                        tx.execute("UPDATE run_steers SET status='cancelled' WHERE run=?1 AND status='pending'", [&run_id])?;
                         // Keep the run active until the ACP worker confirms cancellation.
                         effects.push(Effect::Cancel { run_id });
                         enqueue(
@@ -277,20 +279,30 @@ impl Bridge {
                     )?;
                 }
             }
-        } else if active.is_some() {
-            enqueue(
-                &tx,
-                &conversation.key,
-                "This conversation already has an active run. Wait for it to finish, or use !bridge stop before sending another instruction.",
-                now,
-            )?;
+        } else if let Some((run_id, status)) = active {
+            if !event.body.trim().is_empty() {
+                tx.execute(
+                    "INSERT INTO run_steers VALUES(?1,?2,?3,'pending')",
+                    params![event.event_id, run_id, prompt],
+                )?;
+                enqueue_reaction(&tx, &conversation.key, &event.event_id, "👀", now)?;
+                if status != "cancelling" {
+                    effects.push(Effect::Steer {
+                        run_id,
+                        event_id: event.event_id.clone(),
+                        prompt,
+                    });
+                }
+            }
         } else if !event.body.trim().is_empty() {
             let count: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM runs WHERE status IN ('queued','running','waiting_approval','cancelling')",
                 [],
                 |r| r.get(0),
             )?;
-            if count >= self.config.max_concurrent_runs as i64 {
+            if self.config.max_concurrent_runs != 0
+                && count >= self.config.max_concurrent_runs as i64
+            {
                 enqueue(
                     &tx,
                     &conversation.key,
@@ -335,6 +347,7 @@ impl Bridge {
             | AgentEvent::Text { run_id, .. }
             | AgentEvent::Tool { run_id, .. }
             | AgentEvent::Permission { run_id, .. }
+            | AgentEvent::Steered { run_id, .. }
             | AgentEvent::Finished { run_id, .. } => run_id,
         };
         let Some(run) = self.store.run(run_id)? else {
@@ -427,6 +440,11 @@ impl Bridge {
                     )?;
                 }
             }
+            AgentEvent::Steered { event_id, .. } => {
+                tx.execute("UPDATE run_steers SET status='delivered' WHERE event=?1 AND run=?2 AND status='pending'", params![event_id,run.id])?;
+                tx.execute("UPDATE approvals SET consumed=1 WHERE run=?1", [&run.id])?;
+                tx.execute("UPDATE runs SET status='running' WHERE id=?1", [&run.id])?;
+            }
             AgentEvent::Finished { status, .. } => {
                 ensure!(!status.active(), "completion must have a terminal status");
                 flush_run(&tx, &run, now)?;
@@ -450,6 +468,14 @@ impl Bridge {
                         _ => "❌",
                     };
                     enqueue_reaction(&tx, &run.conversation.key, &event, emoji, now)?;
+                    let steered: Vec<String> = {
+                        let mut stmt = tx.prepare("SELECT event FROM run_steers WHERE run=?1 AND status='delivered' AND event<>?2")?;
+                        stmt.query_map(params![run.id, event], |r| r.get(0))?
+                            .collect::<rusqlite::Result<_>>()?
+                    };
+                    for event in steered {
+                        enqueue_reaction(&tx, &run.conversation.key, &event, emoji, now)?;
+                    }
                 }
             }
         }
@@ -512,6 +538,62 @@ impl Bridge {
                 request_id,
                 option_id: Some(option_id),
             });
+        }
+        Ok(effects)
+    }
+
+    /// A message racing the end of a turn becomes its immediate continuation.
+    /// It is never rejected merely because the prior worker closed its channel.
+    pub fn resume_pending_steers(&mut self, now: i64) -> Result<Vec<Effect>> {
+        let pending: Vec<(String, String)> = {
+            let mut stmt = self.store.db.prepare("SELECT DISTINCT c.key,c.room FROM run_steers s JOIN runs r ON r.id=s.run JOIN conversations c ON c.key=r.conversation WHERE s.status='pending' AND r.status IN ('completed','cancelled')")?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut effects = vec![];
+        for (conversation, room) in pending {
+            if self.store.active_run(&conversation)?.is_some() {
+                continue;
+            }
+            let policy: String = self.store.db.query_row(
+                "SELECT policy FROM conversations WHERE key=?1",
+                [&conversation],
+                |r| r.get(0),
+            )?;
+            if policy != self.config.binding_fingerprint(&room) {
+                continue;
+            }
+            let rows: Vec<(String, String)> = {
+                let mut stmt = self.store.db.prepare("SELECT s.event,s.prompt FROM run_steers s JOIN runs r ON r.id=s.run WHERE r.conversation=?1 AND s.status='pending' AND r.status IN ('completed','cancelled') ORDER BY s.rowid")?;
+                stmt.query_map([&conversation], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            if rows.is_empty() {
+                continue;
+            }
+            let prompt = rows
+                .iter()
+                .map(|(_, p)| p.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\nAdditional instruction:\n");
+            let id = uuid::Uuid::new_v4().to_string();
+            let tx = self.store.db.transaction()?;
+            tx.execute(
+                "INSERT INTO runs VALUES(?1,?2,?3,'queued',?4)",
+                params![id, conversation, prompt, now],
+            )?;
+            tx.execute(
+                "INSERT INTO run_inputs VALUES(?1,?2)",
+                params![id, rows.last().expect("nonempty").0],
+            )?;
+            for (event, _) in rows {
+                tx.execute(
+                    "UPDATE run_steers SET run=?1,status='delivered' WHERE event=?2",
+                    params![id, event],
+                )?;
+            }
+            tx.commit()?;
+            effects.push(Effect::Start { run_id: id });
         }
         Ok(effects)
     }
@@ -592,7 +674,7 @@ impl Bridge {
         snapshot: &RoomSnapshot,
     ) -> Result<Vec<Effect>> {
         let active: Vec<String> = {
-            let mut stmt = self.store.db.prepare("SELECT r.id FROM runs r JOIN conversations c ON c.key=r.conversation WHERE c.room=?1 AND r.status IN ('queued','running','waiting_approval','cancelling')")?;
+            let mut stmt = self.store.db.prepare("SELECT r.id FROM runs r JOIN conversations c ON c.key=r.conversation WHERE c.room=?1 AND (r.status IN ('queued','running','waiting_approval','cancelling') OR EXISTS(SELECT 1 FROM run_steers s WHERE s.run=r.id AND s.status='pending'))")?;
             stmt.query_map([room_id], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?
         };
@@ -606,6 +688,13 @@ impl Bridge {
                 body: String::new(),
             };
             if !self.may_deliver(&probe, snapshot)? {
+                self.store.db.execute(
+                    "UPDATE run_steers SET status='cancelled' WHERE run=?1 AND status='pending'",
+                    [&id],
+                )?;
+                if !run.status.active() {
+                    continue;
+                }
                 self.store
                     .db
                     .execute("UPDATE runs SET status='cancelling' WHERE id=?1", [&id])?;
@@ -637,5 +726,6 @@ fn allow_option(options: &[PermissionOption]) -> Option<String> {
     options
         .iter()
         .find(|o| o.kind == "allow_once")
+        .or_else(|| options.iter().find(|o| o.kind == "allow_always"))
         .map(|o| o.id.clone())
 }

@@ -193,6 +193,7 @@ fn gather(
         }],
         approval_ttl_seconds: 300,
         max_concurrent_runs: 1,
+        tools_socket: None,
     };
     config.validate()?;
     Ok(config)

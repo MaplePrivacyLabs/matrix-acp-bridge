@@ -92,13 +92,14 @@ fn conversations_isolate_threads_and_serialize_work() {
     let first = start(&mut bridge, "one");
     let mut followup = message("two", "follow-up", Some("$one"));
     followup.mentions.clear();
-    assert!(
+    assert!(matches!(
         bridge
             .handle(&followup, &room(), 101)
             .unwrap()
             .effects
-            .is_empty()
-    );
+            .as_slice(),
+        [Effect::Steer { .. }]
+    ));
     let other = start(&mut bridge, "other");
     assert_ne!(
         bridge.store.run(&first).unwrap().unwrap().conversation.key,
@@ -299,7 +300,9 @@ fn stopping_consumes_pending_approvals_and_prevents_overlapping_turn() {
             .handle(&message("stop", "!bridge stop", Some("$one")), &room(), 101)
             .unwrap()
             .effects,
-        vec![Effect::Cancel { run_id: run }]
+        vec![Effect::Cancel {
+            run_id: run.clone()
+        }]
     );
     assert!(
         bridge
@@ -319,6 +322,19 @@ fn stopping_consumes_pending_approvals_and_prevents_overlapping_turn() {
             .effects
             .is_empty()
     );
+    bridge
+        .agent_event(
+            AgentEvent::Finished {
+                run_id: run,
+                status: RunStatus::Cancelled,
+            },
+            103,
+        )
+        .unwrap();
+    assert!(matches!(
+        bridge.resume_pending_steers(104).unwrap().as_slice(),
+        [Effect::Start { .. }]
+    ));
 }
 
 #[test]

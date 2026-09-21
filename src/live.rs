@@ -522,11 +522,14 @@ pub async fn run(config: Config, retry_event: Option<&str>) -> Result<()> {
     }
     let client = restore_client(&config).await?;
     let adapter = MatrixAdapter::from_client(&config, client)?;
+    let tools_server = crate::matrix_tools::listen(config.clone(), adapter.clone()).await?;
+    let mcp_server = crate::matrix_tools::agent_server(config.tools_socket_path());
     let bridge = Bridge::new(config, store)?;
     let mut runner = Runner::new(
         bridge,
         Arc::new(|h| DynConnectTo::new(ScopedProcess(h.clone()))),
-    );
+    )
+    .with_mcp_servers(vec![mcp_server]);
     if let Some(event_id) = retry_event {
         let event = configured_event(adapter.client(), &runner.bridge.config, event_id).await?;
         let snapshot = adapter.snapshot(&event.room_id).await?;
@@ -564,6 +567,7 @@ pub async fn run(config: Config, retry_event: Option<&str>) -> Result<()> {
         }
     }
     runner.shutdown(now()).await?;
+    tools_server.abort();
     if failures >= 5 {
         anyhow::bail!(
             "Matrix driver stopped after repeated failures; staged events remain for recovery"

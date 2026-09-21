@@ -20,11 +20,12 @@ The current implementation requires:
 - `session/new`, text prompts, streamed agent messages and cancellation.
 - Advertised session permission modes and a successful `session/set_mode` for your configured mode.
 - `session/load` or advertised `session/resume` for contextual follow-ups. Session data must persist on the worker.
+- ACP stdio MCP support for Matrix search/attachment tools.
 - Agent-owned filesystem/tools. Client-provided filesystem and terminal capabilities are not advertised.
 
 Run `doctor` before Matrix enrollment. It checks initialization, session creation, offered modes and continuation capability, and rejects a failed mode-setting request. It does not test a real follow-up, run tools, authenticate through an interactive provider flow, or prove the adapter's sandbox enforcement. Any permission request during the check is cancelled. It may leave an empty session in the agent's own storage.
 
-**Live-tested:** Codex ACP 1.12.0 with Codex CLI 0.154.0 on Linux, using ChatGPT authentication and ACP mode `agent`. Its [upstream instructions](https://github.com/agentclientprotocol/codex-acp) cover installation and authentication. The bridge also supports other modes the adapter advertises; `doctor` lists them. Pin adapter versions for repeatable deployments and recheck after upgrades.
+**Live-tested:** Codex ACP 1.12.0 with Codex CLI 0.154.0 on Linux, using ChatGPT authentication and ACP modes `agent` and `agent-full-access`. Its [upstream instructions](https://github.com/agentclientprotocol/codex-acp) cover installation and authentication. The bridge also supports other modes the adapter advertises; `doctor` lists them. Pin adapter versions for repeatable deployments and recheck after upgrades.
 
 **Not yet live-tested here:** other ACP implementations. Contributions should record the adapter version, launch arguments, modes, authentication method (never credentials), new session, resumed follow-up, permission denial, and cancellation. Approval/cancellation currently have protocol-fixture coverage; the first live test covered mention, answer and resumed follow-up.
 
@@ -32,12 +33,12 @@ Run `doctor` before Matrix enrollment. It checks initialization, session creatio
 
 Linux is the deployed platform. macOS is covered by offline build/tests. The subprocess cleanup and service recipe target Unix; Windows support is not established. Rust and Nix development paths are both available; Nix is optional.
 
-One config describes one bot and one agent/workspace profile, with one or more rooms. Threads have distinct agent sessions but **share the configured workspace and credentials**. Start with `max_concurrent_runs = 1` for coding work. Per-thread worktrees, workspace selection and isolated concurrent sandboxes are future work.
+One config describes one bot and one agent/workspace profile, with one or more rooms. Threads have distinct agent sessions but **share the configured workspace and credentials**. Use a positive `max_concurrent_runs` to limit parallel work, or 0 for unlimited independent conversations. Per-thread worktrees, workspace selection and isolated concurrent sandboxes are future work.
 
 ## Prototype limits
 
-- Text messages only. Full prior thread text and its parent are included. No attachment download, image input, edit-as-prompt or rich artifact upload.
-- No mid-turn queuing or steering. Wait, or cancel and resend.
+- Full prior thread text and its parent are included. Images/files/audio/video can be retrieved through Matrix tools. No edit-as-prompt or rich artifact upload.
+- Steering uses standard ACP cancel-and-resume in the same session. A running tool may be interrupted. Native provider steering extensions are not used.
 - Room-membership mode permits membership/operator changes without resetting threads. Configured-audience mode retains strict policy/roster bindings. Worker runtime changes still need a fresh binding.
 - Provider-specific model/config controls and ACP extensions are not exposed in Matrix yet. Configure defaults in the agent's own profile.
 - Sync continuity/decryption failures stop progress conservatively. Backfill is limited to 500 events; longer gaps need operator recovery tooling.

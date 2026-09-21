@@ -79,6 +79,12 @@ enum Commands {
         config: PathBuf,
         user_id: String,
     },
+    /// Expose the running bridge's local Matrix tools over MCP stdio.
+    #[cfg(feature = "matrix")]
+    Tools {
+        #[arg(long)]
+        socket: PathBuf,
+    },
     /// Run the encrypted Matrix and ACP bridge in the foreground.
     #[cfg(feature = "matrix")]
     Run {
@@ -182,6 +188,10 @@ async fn main() -> Result<()> {
             matrix_acp_bridge::live::verify(config, &user_id).await?;
         }
         #[cfg(feature = "matrix")]
+        Commands::Tools { socket } => {
+            matrix_acp_bridge::matrix_tools::proxy(&socket).await?;
+        }
+        #[cfg(feature = "matrix")]
         Commands::Run {
             config,
             retry_event,
@@ -208,6 +218,7 @@ async fn demo(scenario: Scenario) -> Result<()> {
         room_id: config.rooms[0].room_id.clone(),
         sender: "@owner:example.invalid".into(),
         body: body.into(),
+        attachment: None,
         thread_root: thread.map(str::to_owned),
         reply_to: None,
         mentions: BTreeSet::from([config.bot_user_id.clone()]),

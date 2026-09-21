@@ -10,6 +10,7 @@ pub struct Incoming {
     pub room_id: String,
     pub sender: String,
     pub body: String,
+    pub attachment: Option<Attachment>,
     pub thread_root: Option<String>,
     pub reply_to: Option<String>,
     pub mentions: BTreeSet<String>,
@@ -18,6 +19,15 @@ pub struct Incoming {
     /// SDK linked this message to a known sender device without a trust violation.
     /// This is account/device-list trust, not independently verified identity.
     pub known_sender_device: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Attachment {
+    pub name: String,
+    pub mime_type: String,
+    /// Matrix media descriptor, including the encrypted-file key when present.
+    /// Never include this source descriptor in prompts or public logs.
+    pub source: serde_json::Value,
 }
 
 #[derive(Clone, Debug)]
@@ -120,6 +130,10 @@ pub enum AgentEvent {
         title: String,
         options: Vec<PermissionOption>,
     },
+    Steered {
+        run_id: String,
+        event_id: String,
+    },
     Finished {
         run_id: String,
         status: RunStatus,
@@ -133,6 +147,11 @@ pub enum Effect {
     },
     Cancel {
         run_id: String,
+    },
+    Steer {
+        run_id: String,
+        event_id: String,
+        prompt: String,
     },
     Decide {
         run_id: String,

@@ -31,6 +31,7 @@ pub fn message(id: &str, body: &str, root: Option<&str>) -> Incoming {
         room_id: config().rooms[0].room_id.clone(),
         sender: "@owner:example.invalid".into(),
         body: body.into(),
+        attachment: None,
         thread_root: root.map(str::to_owned),
         reply_to: None,
         mentions: BTreeSet::from([config().bot_user_id]),

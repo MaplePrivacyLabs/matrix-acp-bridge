@@ -13,6 +13,7 @@ The Matrix and ACP SDKs own their wire protocols. The bridge owns the meaning of
 | `store.rs` | SQLite transactions, exclusive ownership, wire staging, inbox/outbox and recovery |
 | `runner.rs` | Worker lifecycle, bounded event channels, control messages and shutdown |
 | `acp.rs` | Official ACP client, capability negotiation, mode enforcement and scoped stdio transport |
+| `matrix_tools.rs` | Local read-only MCP server using the live SDK client, plus stdio proxy |
 | `matrix.rs` | Optional official Matrix SDK adapter and standard thread rendering |
 | `offline.rs` | Deterministic SDK agent fixture, with no AI or tools |
 | `live.rs` | Enrollment, cross-signing verification, token persistence and sync loop |
@@ -48,9 +49,13 @@ The journal contains decrypted prompts and output; private directory permissions
 
 The client uses stable protocol-v1 entrypoints and advertised capabilities. It loads a stored session when supported, otherwise uses advertised resume support, otherwise refuses to pretend context survived. It requires an advertised permission mode and an acknowledged mode-setting request before the prompt. Client-provided filesystem and terminal capabilities remain disabled.
 
-Permission callbacks release the SDK dispatch loop while waiting for a human. Blocking that loop would prevent cancellation and other incoming traffic. Responses preserve actual offered option IDs; unknown choices never become approval. An explicit room or conversation policy can consume an offered allow_once choice automatically, with a durable decision record. No persistent backend permission is selected automatically. A cancellation request also closes approval admission.
+Permission callbacks release the SDK dispatch loop while waiting for a human. Blocking that loop would prevent cancellation and other incoming traffic. Responses preserve actual offered option IDs; unknown choices never become approval. An explicit room or conversation policy can consume an offered allow_once choice automatically, with a durable decision record. An offered persistent allow choice is a fallback when no allow-once choice exists. A cancellation request also closes approval admission.
 
 Normal model turns have no artificial duration or output-token cap. Initialization/session/mode handshakes have 30-second deadlines. Explicit cancellation has a five-second grace period, after which the run is marked interrupted and the transport closes. The subprocess transport clears inherited environment variables and owns a Unix process group. It provides lifecycle hygiene, not a sandbox.
+
+The running Matrix SDK client also serves read-only MCP tools over a private Unix socket. ACP new/load/resume requests receive a stdio proxy server automatically. Search paginates server history and decrypts through that same device store; no second Matrix login is created.
+
+Active-thread instructions are journaled as steering. The ACP client cancels the active prompt and resumes the same session with new context. If completion wins the race, the journal creates one immediate continuation. Explicit stop and restart discard pending steering instead of replaying work.
 
 ## References inspected
 

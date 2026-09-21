@@ -88,6 +88,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS outbox(txn TEXT PRIMARY KEY, conversation TEXT NOT NULL REFERENCES conversations(key), body TEXT NOT NULL, delivered_event TEXT, created INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS approvals(id TEXT PRIMARY KEY, run TEXT NOT NULL REFERENCES runs(id), options TEXT NOT NULL, expires INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS output(seq INTEGER PRIMARY KEY, run TEXT NOT NULL REFERENCES runs(id), body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS run_steers(event TEXT PRIMARY KEY, run TEXT NOT NULL REFERENCES runs(id), prompt TEXT NOT NULL, status TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS conversation_permissions(conversation TEXT PRIMARY KEY REFERENCES conversations(key), automatic INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS approval_decisions(request TEXT PRIMARY KEY REFERENCES approvals(id), option TEXT NOT NULL, source TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS run_inputs(run TEXT PRIMARY KEY REFERENCES runs(id), event TEXT NOT NULL);
@@ -274,6 +275,10 @@ impl Store {
             )?;
         }
         tx.execute("UPDATE approvals SET consumed=1 WHERE consumed=0", [])?;
+        tx.execute(
+            "UPDATE run_steers SET status='interrupted' WHERE status='pending'",
+            [],
+        )?;
         tx.commit()?;
         Ok(active.len())
     }
