@@ -11,6 +11,7 @@ The Matrix and ACP SDKs own their wire protocols. The bridge owns the meaning of
 | `config.rs` | Strict TOML validation and immutable binding fingerprint |
 | `core.rs` | Authorization, triggers, room/thread routing, approvals, cancellation and delivery policy |
 | `store.rs` | SQLite transactions, exclusive ownership, wire staging, inbox/outbox and recovery |
+| `context.rs`, `context_ledger.rs` | One-time introduction, attributed input deltas and persistent delivered-context tracking |
 | `runner.rs` | Worker lifecycle, bounded event channels, control messages and shutdown |
 | `acp.rs` | Official ACP client, capability negotiation, mode enforcement and scoped stdio transport |
 | `matrix_tools.rs` | Local read-only MCP server using the live SDK client, plus stdio proxy |
@@ -35,13 +36,17 @@ The roster check cannot retract already delivered plaintext, old keys or files r
 
 Inbound event identity and run creation are recorded in one transaction. A partial unique index prevents concurrent runs in one conversation. Context is fetched with the SDK before admitting work. Thread relations are paginated in forward order from the root through the triggering event; later messages and unrelated threads are not included. Missing/decryption-failed context retains the staged request rather than invoking an agent without its parent. The prompt identifies Matrix, attributes each message and separates history from the authorized instruction.
 
+An event-ID ledger filters the fetched context before model input: introduction and baseline once per ACP session, then only unseen sender/message lines. Unseen reader context has a `[context]` prefix; the authorized message is last. The current implementation still fetches server history for reconciliation, but does not append that history repeatedly to the model's session. ACP has no portable system-role field here, so the introduction is part of the first ordinary prompt and leaves the harness's own instructions intact.
+
+Input batches are staged transactionally with runs/steering. Observable agent output or successful completion confirms delivery. Active staged batches prevent duplicate context across closely spaced messages; failed or interrupted unconfirmed batches are abandoned so a later request can recover their context. Recovery is conservative: an ambiguous crash can repeat some context, rather than silently omit it. Explicit session resets receive a new baseline. Existing successful full-JSON prompts seed the ledger during upgrade without resetting ACP sessions. Delivered Matrix copies of this agent's output are not echoed into a session that already contains them.
+
 Approval choice consumption is transactional and scoped to the active run/conversation; invalid choices do not consume it. Cancellation enters a distinct state and rejects later permission/output events until the worker settles.
 
 The Matrix adapter first fetches the raw `/sync` response using the official client request API and stages permitted-room wire events in the application journal. It then performs a zero-wait SDK sync from the same cursor for SDK-owned room/key processing and decrypts the staged events with the SDK. This extra sync request is intentional: the SDK suppresses a repeated `next_batch`, so relying only on its processed response leaves a crash window. Application checkpoint and staged-batch removal are atomic after durable event admission.
 
 First sync establishes a baseline without running historical prompts. Later timeline gaps and undecryptable events hold the staged batch instead of advancing past it. A limited timeline can backfill up to 500 events to the last checkpointed room event. Missing continuity retains the staged cursor; richer recovery UX is still needed. The current implementation favors a visible stop over silently dropping work.
 
-Outbound chunks have persistent transaction IDs. Uncertain HTTP sends retry with the same ID; successfully acknowledged sends are marked delivered. This does not give exactly-once external agent side effects. Restart marks queued/running/waiting/cancelling runs interrupted, cancels approvals and requires human review before new instructions.
+Assistant text chunks are journaled and coalesced until a tool, permission, continuation or terminal-turn event. Periodic ticks flush only leftovers from terminal runs, never an in-progress sentence. Outbound messages have persistent transaction IDs. Uncertain HTTP sends retry with the same ID; successfully acknowledged sends are marked delivered. This does not give exactly-once external agent side effects. Restart marks queued/running/waiting/cancelling runs interrupted, cancels approvals and requires human review before new instructions.
 
 The journal contains decrypted prompts and output; private directory permissions are not disk encryption. The Matrix crypto store separately requires a passphrase. Backups and retention must protect both stores.
 
@@ -55,7 +60,7 @@ Normal model turns have no artificial duration or output-token cap. Initializati
 
 The running Matrix SDK client also serves read-only MCP tools over a private Unix socket. ACP new/load/resume requests receive a stdio proxy server automatically. Search paginates server history and decrypts through that same device store; no second Matrix login is created.
 
-Active-thread instructions are journaled as steering. The ACP client cancels the active prompt and resumes the same session with new context. If completion wins the race, the journal creates one immediate continuation. Explicit stop and restart discard pending steering instead of replaying work.
+Active-thread instructions are journaled as steering. The ACP client cancels the active prompt and resumes the same session with new message lines. If completion wins the race, the journal creates one immediate continuation. Explicit stop and restart discard pending steering instead of replaying work.
 
 ## References inspected
 

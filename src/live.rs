@@ -206,9 +206,9 @@ pub async fn inspect_context(config: Config, event_id: &str) -> Result<()> {
     let event = configured_event(&client, &config, event_id).await?;
     let adapter = MatrixAdapter::from_client(&config, client)?;
     let history = adapter.context_for(&event).await?;
-    let prompt = crate::context::prompt(&config, &event, &history)?;
     let snapshot = adapter.snapshot(&event.room_id).await?;
     let bridge = Bridge::new(config.clone(), store)?;
+    let prepared = bridge.prepare_context(&event, &history)?;
     let members: std::collections::BTreeSet<_> = history.iter().map(|e| e.sender.clone()).collect();
     println!(
         "{}",
@@ -218,7 +218,9 @@ pub async fn inspect_context(config: Config, event_id: &str) -> Result<()> {
             "history_messages":history.len(),
             "parent_included":event.thread_root.as_ref().is_some_and(|root|history.iter().any(|e| &e.event_id==root)),
             "context_senders":members,
-            "prompt_bytes":prompt.len(),
+            "prompt_bytes":prepared.prompt.len(),
+            "included_messages":prepared.events.len(),
+            "initial_context":prepared.initial,
             "agent_started":false,
             "journal_runs":bridge.store.count_runs()?,
             "sender_authorized":bridge.authorized(&event, &snapshot),

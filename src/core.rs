@@ -133,6 +133,16 @@ impl Bridge {
         Ok(!seen)
     }
 
+    pub fn prepare_context(
+        &self,
+        event: &Incoming,
+        history: &[Incoming],
+    ) -> Result<crate::context::Prepared> {
+        let conversation = self.conversation(event);
+        let (known, initial) = crate::context_ledger::known(&self.store.db, &conversation.key)?;
+        crate::context::prepare(&self.config, event, history, &known, initial)
+    }
+
     pub fn handle(&mut self, event: &Incoming, room: &RoomSnapshot, now: i64) -> Result<Handled> {
         self.handle_with_context(event, room, None, now)
     }
@@ -155,11 +165,15 @@ impl Bridge {
             .expect("admitted room")
             .audience_binding(&room.members);
         let command = event.body.trim().starts_with("!bridge ");
-        let prompt = if let Some(context) = context {
-            crate::context::prompt(&self.config, event, context)?
+        let prepared = if let Some(context) = context.filter(|_| !command) {
+            Some(self.prepare_context(event, context)?)
         } else {
-            event.body.clone()
+            None
         };
+        let prompt = prepared
+            .as_ref()
+            .map(|p| p.prompt.clone())
+            .unwrap_or_else(|| event.body.clone());
 
         let tx = self.store.db.transaction()?;
         if tx.execute(
@@ -183,6 +197,7 @@ impl Bridge {
                     enqueue(&tx, &conversation.key, &text, now)?;
                 }
                 ["!bridge", "stop"] => {
+                    tx.execute("UPDATE context_batches SET state='abandoned' WHERE conversation=?1 AND state='pending'", [&conversation.key])?;
                     tx.execute("UPDATE run_steers SET status='cancelled' WHERE status='pending' AND run IN (SELECT id FROM runs WHERE conversation=?1)", [&conversation.key])?;
                     if let Some((run_id, _)) = active {
                         tx.execute("UPDATE runs SET status='cancelling' WHERE id=?1", [&run_id])?;
@@ -285,6 +300,16 @@ impl Bridge {
                     "INSERT INTO run_steers VALUES(?1,?2,?3,'pending')",
                     params![event.event_id, run_id, prompt],
                 )?;
+                if let Some(prepared) = &prepared {
+                    crate::context_ledger::stage(
+                        &tx,
+                        &conversation.key,
+                        &run_id,
+                        &event.event_id,
+                        prepared,
+                        true,
+                    )?;
+                }
                 enqueue_reaction(&tx, &conversation.key, &event.event_id, "👀", now)?;
                 if status != "cancelling" {
                     effects.push(Effect::Steer {
@@ -318,6 +343,16 @@ impl Bridge {
                 "INSERT INTO run_inputs(run,event) VALUES(?1,?2)",
                 params![id, event.event_id],
             )?;
+            if let Some(prepared) = &prepared {
+                crate::context_ledger::stage(
+                    &tx,
+                    &conversation.key,
+                    &id,
+                    &event.event_id,
+                    prepared,
+                    false,
+                )?;
+            }
             enqueue_reaction(&tx, &conversation.key, &event.event_id, "👀", now)?;
             effects.push(Effect::Start { run_id: id });
         }
@@ -361,6 +396,12 @@ impl Bridge {
         }
         let automatic = self.automatic_tools(&run.conversation)?;
         let tx = self.store.db.transaction()?;
+        if matches!(
+            &event,
+            AgentEvent::Text { .. } | AgentEvent::Tool { .. } | AgentEvent::Permission { .. }
+        ) {
+            crate::context_ledger::observed(&tx, &run.id)?;
+        }
         match event {
             AgentEvent::SessionReady { session_id, .. } => {
                 ensure!(!session_id.is_empty(), "empty ACP session ID");
@@ -374,6 +415,10 @@ impl Bridge {
                     "UPDATE conversations SET session=?2 WHERE key=?1",
                     params![run.conversation.key, session_id],
                 )?;
+                tx.execute(
+                    "UPDATE context_sessions SET session=?2 WHERE conversation=?1",
+                    params![run.conversation.key, session_id],
+                )?;
             }
             AgentEvent::Text { text, .. } => {
                 tx.execute(
@@ -382,6 +427,9 @@ impl Bridge {
                 )?;
             }
             AgentEvent::Tool { title, .. } => {
+                // A tool call ends the preceding assistant text segment. Timer
+                // ticks are not message boundaries: they can split a sentence.
+                flush_run(&tx, &run, now)?;
                 enqueue(
                     &tx,
                     &run.conversation.key,
@@ -395,6 +443,7 @@ impl Bridge {
                 options,
                 ..
             } => {
+                flush_run(&tx, &run, now)?;
                 ensure!(!options.is_empty(), "permission request offered no actions");
                 let option_ids: std::collections::BTreeSet<_> =
                     options.iter().map(|o| &o.id).collect();
@@ -441,12 +490,22 @@ impl Bridge {
                 }
             }
             AgentEvent::Steered { event_id, .. } => {
+                flush_run(&tx, &run, now)?;
+                tx.execute("UPDATE context_batches SET state='inflight' WHERE input=?1 AND run=?2 AND state='pending'",params![event_id,run.id])?;
                 tx.execute("UPDATE run_steers SET status='delivered' WHERE event=?1 AND run=?2 AND status='pending'", params![event_id,run.id])?;
                 tx.execute("UPDATE approvals SET consumed=1 WHERE run=?1", [&run.id])?;
                 tx.execute("UPDATE runs SET status='running' WHERE id=?1", [&run.id])?;
             }
             AgentEvent::Finished { status, .. } => {
                 ensure!(!status.active(), "completion must have a terminal status");
+                if status == RunStatus::Completed {
+                    crate::context_ledger::observed(&tx, &run.id)?;
+                } else {
+                    tx.execute("UPDATE context_batches SET state='abandoned' WHERE run=?1 AND state='inflight'",[&run.id])?;
+                }
+                if matches!(status, RunStatus::Failed | RunStatus::Interrupted) {
+                    tx.execute("UPDATE context_batches SET state='abandoned' WHERE run=?1 AND state='pending'",[&run.id])?;
+                }
                 flush_run(&tx, &run, now)?;
                 tx.execute(
                     "UPDATE runs SET status=?2 WHERE id=?1",
@@ -575,7 +634,7 @@ impl Bridge {
                 .iter()
                 .map(|(_, p)| p.as_str())
                 .collect::<Vec<_>>()
-                .join("\n\nAdditional instruction:\n");
+                .join("\n");
             let id = uuid::Uuid::new_v4().to_string();
             let tx = self.store.db.transaction()?;
             tx.execute(
@@ -587,6 +646,7 @@ impl Bridge {
                 params![id, rows.last().expect("nonempty").0],
             )?;
             for (event, _) in rows {
+                tx.execute("UPDATE context_batches SET run=?1,state='inflight' WHERE input=?2 AND state='pending'",params![id,event])?;
                 tx.execute(
                     "UPDATE run_steers SET run=?1,status='delivered' WHERE event=?2",
                     params![id, event],
@@ -600,7 +660,9 @@ impl Bridge {
 
     pub fn flush_progress(&mut self, now: i64) -> Result<()> {
         let ids: Vec<String> = {
-            let mut stmt = self.store.db.prepare("SELECT DISTINCT run FROM output")?;
+            // Only recover leftovers from terminal runs. Active text is emitted
+            // at tool/permission/continuation boundaries or turn completion.
+            let mut stmt = self.store.db.prepare("SELECT DISTINCT o.run FROM output o JOIN runs r ON r.id=o.run WHERE r.status NOT IN ('queued','running','waiting_approval','cancelling')")?;
             stmt.query_map([], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?
         };
@@ -715,7 +777,7 @@ fn flush_run(db: &rusqlite::Connection, run: &Run, now: i64) -> Result<()> {
             .collect::<rusqlite::Result<Vec<_>>>()?
             .concat()
     };
-    if !text.is_empty() {
+    if !text.trim().is_empty() {
         enqueue(db, &run.conversation.key, &text, now)?;
     }
     db.execute("DELETE FROM output WHERE run=?1", [&run.id])?;

@@ -46,13 +46,12 @@ async fn reader_parent_and_complete_thread_reach_acp_without_granting_reader_aut
     assert_eq!(finish(&mut runner).await, RunStatus::Completed);
     let observations = agent.observations.lock().unwrap();
     let prompt = &observations.prompts[0];
-    let json: serde_json::Value =
-        serde_json::from_str(prompt.split_once("\n\n").unwrap().1).unwrap();
-    assert_eq!(json["history"].as_array().unwrap().len(), 206);
-    assert_eq!(json["history"][0]["sender"], reader);
-    assert_eq!(json["history"][0]["body"], parent.body);
-    assert_eq!(json["history"][205]["body"], "detail 204");
-    assert_eq!(json["authorized_request"]["body"], "Answer the reader");
+    assert!(prompt.starts_with(context::SESSION_INSTRUCTIONS));
+    assert!(prompt.contains(&format!("[context] {reader}: {}", parent.body)));
+    for i in 0..205 {
+        assert!(prompt.contains(&format!("[context] {reader}: detail {i}")));
+    }
+    assert!(prompt.ends_with("@owner:example.invalid: Answer the reader"));
     assert_eq!(runner.bridge.store.count_runs().unwrap(), 1);
 }
 
@@ -318,7 +317,7 @@ fn attachments_are_addressable_without_leaking_encryption_keys_into_prompts() {
         source: serde_json::json!({"file":{"key":{"k":"fixture-key-not-prompt-data"}}}),
     });
     let prompt = context::prompt(&config(), &request, &[]).unwrap();
-    assert!(prompt.contains("matrix_attachment"));
+    assert!(prompt.contains("[attachment "));
     assert!(prompt.contains("diagram.png"));
     assert!(prompt.contains(&request.event_id));
     assert!(!prompt.contains("fixture-key-not-prompt-data"));

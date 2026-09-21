@@ -59,7 +59,11 @@ Keep the bot’s state directory: recreating it creates a different device and l
 
 Wait for the initial sync, then send a **real Matrix mention pill** for the bot in the room, such as “@my-agent please explain this project's tests.” It reacts 👀, answers in a thread, and reacts ✅ when finished. Reply **in that thread** to continue; another mention is not required there. Send a new room mention to start a separate thread/session.
 
-Messages predating the first run's sync baseline do not start work. When an operator requests work in a thread, the bridge automatically supplies its parent and all earlier decryptable text replies, including messages from permitted readers who are not operators. It paginates the whole thread without a hidden message limit. History is labeled as conversation data; only the current authorized request starts work. A new room-level mention receives nearby preceding context (a 40-event Matrix context window), plus an explicit reply target when present. Image, file, audio and video messages include attachment descriptors; the agent can retrieve them using `matrix_attachment`. Images are returned as image content; other files are downloaded for the agent’s own tools. Message edits remain out of scope.
+Messages predating the first run's sync baseline do not start work. On the first request in a thread, the bridge supplies its parent and all earlier decryptable text replies, including messages from permitted readers who are not operators. It paginates the whole thread without a hidden message limit. History is labeled as conversation data; only an authorized request starts work. A new room-level mention receives nearby preceding context (a 40-event Matrix context window), plus an explicit reply target when present. Image, file, audio and video messages include attachment descriptors; the agent can retrieve them using `matrix_attachment`. Images are returned as image content; other files are downloaded for the agent’s own tools. Message edits remain out of scope.
+
+The first ACP input includes a short introduction and that initial history. Follow-ups reuse the same agent session and contain only new messages, normally one line such as `@alice:example.org: What about the other option?`. Any intervening reader messages are included once as `[context]` lines. The bridge does not repeat the introduction, old history or the agent's own replies. This bookkeeping survives bridge restarts and upgrades from the earlier full-context format. The introduction is ordinary ACP input, not a system-role override; it asks the agent to use its judgment about responding, adjusting its work or continuing without a reply.
+
+Streamed reply fragments are combined until turn completion or a tool, permission or continuation boundary. A timer never posts half a sentence as a separate message. Progress text before a tool can still appear while work is running.
 
 ## Permissions and conversations
 
@@ -85,7 +89,7 @@ For an additional fixed reader allowlist, use `audience_policy = "configured"` a
 
 Use additional `[[rooms]]` entries for more rooms. `conversation = "thread"` is the default; `"room"` uses one session for the entire room. Changing the actual harness/workspace/credentials still requires a fresh session binding; changing ordinary channel access in room-membership mode does not.
 
-A follow-up arriving during work steers the same ACP session: the bridge cancels the current turn and immediately resumes with the new instruction and thread context. This can interrupt a running tool. It does not enqueue a separate job or ask you to resend. An end-of-turn race is recovered durably as a continuation. `max_concurrent_runs = 0` removes the worker-wide concurrency limit; positive values limit independent conversations. No hidden model-token or turn-duration limit is imposed.
+A follow-up arriving during work steers the same ACP session: the bridge cancels the current turn and immediately resumes with only the new messages. This can interrupt a running tool. It does not enqueue a separate job or ask you to resend. An end-of-turn race is recovered durably as a continuation. `max_concurrent_runs = 0` removes the worker-wide concurrency limit; positive values limit independent conversations. No hidden model-token or turn-duration limit is imposed.
 
 ## Matrix tools
 

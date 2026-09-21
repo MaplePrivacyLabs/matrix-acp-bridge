@@ -284,7 +284,7 @@ pub async fn execute(
                     }
                 };
                 if !steering.is_empty() && matches!(outcome, RunStatus::Completed | RunStatus::Cancelled) {
-                    next_prompt = steering.iter().map(|(_,p)|p.as_str()).collect::<Vec<_>>().join("\n\nAdditional instruction:\n");
+                    next_prompt = steering.iter().map(|(_,p)|p.as_str()).collect::<Vec<_>>().join("\n");
                     for (event_id,_) in steering {
                         updates.send(AgentEvent::Steered {run_id:run.id.clone(),event_id}).await.map_err(|_|error("controller closed"))?;
                     }

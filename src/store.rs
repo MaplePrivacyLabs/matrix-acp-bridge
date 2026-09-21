@@ -114,6 +114,7 @@ impl Store {
         );
         db.execute("INSERT OR REPLACE INTO meta VALUES('schema','2')", [])?;
         db.execute("INSERT OR IGNORE INTO meta VALUES('bot',?1)", [bot])?;
+        crate::context_ledger::initialize(&db)?;
         Ok(Self { db, _lock: lock })
     }
 
@@ -275,6 +276,10 @@ impl Store {
             )?;
         }
         tx.execute("UPDATE approvals SET consumed=1 WHERE consumed=0", [])?;
+        tx.execute(
+            "UPDATE context_batches SET state='abandoned' WHERE state IN ('pending','inflight')",
+            [],
+        )?;
         tx.execute(
             "UPDATE run_steers SET status='interrupted' WHERE status='pending'",
             [],
