@@ -735,7 +735,15 @@ impl Bridge {
 
     /// Re-check before delivery, not just when the original prompt was accepted.
     pub fn may_deliver(&self, message: &Outbound, snapshot: &RoomSnapshot) -> Result<bool> {
-        let Some(policy) = self.config.room(&message.conversation.room_id) else {
+        self.may_deliver_to(&message.conversation, snapshot)
+    }
+
+    pub fn may_deliver_to(
+        &self,
+        conversation: &Conversation,
+        snapshot: &RoomSnapshot,
+    ) -> Result<bool> {
+        let Some(policy) = self.config.room(&conversation.room_id) else {
             return Ok(false);
         };
         let expected: Option<(String, String)> = self
@@ -743,7 +751,7 @@ impl Bridge {
             .db
             .query_row(
                 "SELECT policy,audience FROM conversations WHERE key=?1",
-                [&message.conversation.key],
+                [&conversation.key],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
@@ -752,9 +760,7 @@ impl Bridge {
             && snapshot.members.contains(&self.config.bot_user_id)
             && policy.permits_members(&snapshot.members)
             && expected.is_some_and(|(p, a)| {
-                p == self
-                    .config
-                    .binding_fingerprint(&message.conversation.room_id)
+                p == self.config.binding_fingerprint(&conversation.room_id)
                     && a == policy.audience_binding(&snapshot.members)
             }))
     }

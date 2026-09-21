@@ -96,6 +96,14 @@ pub struct Outbound {
     pub reaction: Option<Reaction>,
 }
 
+/// A bot-owned reaction to remove after its replacement status is delivered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReactionRemoval {
+    pub transaction_id: String,
+    pub conversation: Conversation,
+    pub event_id: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Reaction {
     pub event_id: String,

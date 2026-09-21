@@ -8,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::model::{Conversation, Outbound, Reaction, Run, RunStatus};
+use crate::model::{Conversation, Outbound, Reaction, ReactionRemoval, Run, RunStatus};
 
 pub struct Store {
     pub(crate) db: Connection,
@@ -93,6 +93,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS approval_decisions(request TEXT PRIMARY KEY REFERENCES approvals(id), option TEXT NOT NULL, source TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS run_inputs(run TEXT PRIMARY KEY REFERENCES runs(id), event TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox_reactions(txn TEXT PRIMARY KEY REFERENCES outbox(txn), event TEXT NOT NULL, key TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS reaction_cleanup(txn TEXT PRIMARY KEY, target_txn TEXT NOT NULL UNIQUE REFERENCES outbox(txn), delivered_event TEXT);
             CREATE TABLE IF NOT EXISTS explicit_outbox(txn TEXT PRIMARY KEY REFERENCES outbox(txn), run TEXT NOT NULL REFERENCES runs(id));
             CREATE TABLE IF NOT EXISTS outbox_failures(txn TEXT PRIMARY KEY REFERENCES outbox(txn), reason TEXT NOT NULL);
         ")?;
@@ -168,8 +169,65 @@ impl Store {
     }
 
     pub fn delivered(&mut self, txn: &str, event: &str) -> Result<()> {
-        self.db.execute(
+        let tx = self.db.transaction()?;
+        let recorded = tx.execute(
             "UPDATE outbox SET delivered_event=?2 WHERE txn=?1 AND delivered_event IS NULL",
+            params![txn, event],
+        )?;
+        if recorded > 0 {
+            // Keep the acknowledgement and cleanup in one commit. We remove only
+            // this bot's earlier eyes reaction to the same message, and only once
+            // the replacement status has actually reached the Matrix server.
+            let targets: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT eyes.txn FROM outbox terminal
+                     JOIN outbox_reactions status ON status.txn=terminal.txn
+                     JOIN outbox eyes ON eyes.conversation=terminal.conversation AND eyes.rowid<terminal.rowid
+                     JOIN outbox_reactions reaction ON reaction.txn=eyes.txn
+                     WHERE terminal.txn=?1 AND status.key IN ('✅','❌','🛑','⚠️')
+                     AND reaction.event=status.event AND reaction.key='👀'
+                     AND NOT EXISTS(SELECT 1 FROM reaction_cleanup d WHERE d.target_txn=eyes.txn)",
+                )?;
+                stmt.query_map([txn], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            for target in targets {
+                let id = uuid::Uuid::new_v4().to_string();
+                tx.execute(
+                    "INSERT INTO reaction_cleanup(txn,target_txn) VALUES(?1,?2)",
+                    params![id, target],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn pending_reaction_removals(&self) -> Result<Vec<ReactionRemoval>> {
+        let mut stmt = self.db.prepare(
+            "SELECT d.txn,c.key,c.room,c.root,target.delivered_event FROM reaction_cleanup d
+             JOIN outbox target ON target.txn=d.target_txn
+             JOIN conversations c ON c.key=target.conversation
+             WHERE d.delivered_event IS NULL AND target.delivered_event IS NOT NULL ORDER BY d.rowid",
+        )?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok(ReactionRemoval {
+                    transaction_id: r.get(0)?,
+                    conversation: Conversation {
+                        key: r.get(1)?,
+                        room_id: r.get(2)?,
+                        thread_root: r.get(3)?,
+                    },
+                    event_id: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn reaction_removed(&mut self, txn: &str, event: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE reaction_cleanup SET delivered_event=?2 WHERE txn=?1 AND delivered_event IS NULL",
             params![txn, event],
         )?;
         Ok(())

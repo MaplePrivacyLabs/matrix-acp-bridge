@@ -392,6 +392,33 @@ impl MatrixAdapter {
                 .delivered(&message.transaction_id, &event_id)?;
             count += 1;
         }
+        for removal in runner.bridge.store.pending_reaction_removals()? {
+            let snapshot = self.snapshot(&removal.conversation.room_id).await?;
+            if !runner
+                .bridge
+                .may_deliver_to(&removal.conversation, &snapshot)?
+            {
+                continue;
+            }
+            let id: ruma::OwnedRoomId = removal.conversation.room_id.parse()?;
+            let room = self
+                .client
+                .get_room(&id)
+                .ok_or_else(|| anyhow::anyhow!("room is not joined"))?;
+            ensure!(
+                room.state() == RoomState::Joined && room.encryption_state().is_encrypted(),
+                "refusing plaintext or unjoined delivery"
+            );
+            let event: ruma::OwnedEventId = removal.event_id.parse()?;
+            let response = room
+                .redact(&event, None, Some(removal.transaction_id.clone().into()))
+                .await?;
+            runner
+                .bridge
+                .store
+                .reaction_removed(&removal.transaction_id, response.event_id.as_str())?;
+            count += 1;
+        }
         Ok(count)
     }
 }

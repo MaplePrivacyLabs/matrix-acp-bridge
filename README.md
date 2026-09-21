@@ -9,7 +9,7 @@ Bring your own coding agent into a Matrix room. Mention its bot account to start
 - Encrypted messages, explicit operators and room audiences, optional cross-verification, and separate sessions per thread or room.
 - Optional manual or automatic tool approval, same-session steering, persistent sessions and a durable inbox/outbox.
 - Matrix history search with sender/date filters, full-thread reading, and image/file attachments.
-- Status reactions: 👀 accepted, ✅ completed, ❌ failed, 🛑 cancelled, ⚠️ interrupted. Answers stay in the thread.
+- Status reactions: 👀 accepted, ✅ completed, ❌ failed, 🛑 cancelled, ⚠️ interrupted. Once a terminal reaction is delivered, the bot removes its 👀 from that message. Answers stay in the thread.
 
 No dependency on Tailscale, a particular cloud, Bitwarden, SecretSpec, or Codex. The worker needs outbound HTTPS to Matrix and its agent's services. Federation does not need to be disabled. There is no inbound ACP listener.
 
