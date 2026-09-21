@@ -230,11 +230,26 @@ async fn doctor_checks_modes_without_prompting_or_loading_a_conversation() {
 async fn doctor_reports_available_modes_and_does_not_fall_back() {
     let agent = matrix_acp_bridge::offline::FixtureAgent::new(Behavior::Reply);
     let mut harness = config().harness;
-    harness.mode = "unavailable".into();
+    harness.mode = Some("unavailable".into());
     let report = matrix_acp_bridge::acp::inspect(agent.transport(), harness)
         .await
         .unwrap();
     assert!(!report.mode_applied);
     assert_eq!(report.modes, ["read-only"]);
     assert!(agent.observations.lock().unwrap().prompts.is_empty());
+}
+
+#[tokio::test]
+async fn modes_may_be_omitted_only_when_configuration_does_not_require_one() {
+    let agent = matrix_acp_bridge::offline::FixtureAgent::new(Behavior::NoModes);
+    let mut harness = config().harness;
+    let rejected = matrix_acp_bridge::acp::inspect(agent.transport(), harness.clone())
+        .await
+        .unwrap();
+    assert!(!rejected.mode_applied);
+    harness.mode = None;
+    let report = matrix_acp_bridge::acp::inspect(agent.transport(), harness)
+        .await
+        .unwrap();
+    assert!(report.mode_applied && report.modes.is_empty());
 }

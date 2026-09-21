@@ -2,10 +2,10 @@
 
 Bring your own coding agent into a Matrix room. Mention its bot account to start work; it replies in a thread, and follow-up messages in that thread resume the same agent session. Written in Rust using the official Matrix and Agent Client Protocol SDKs.
 
-**Early working prototype.** Encrypted mentions, threaded answers, and contextual follow-ups across a bridge restart have been exercised with stock Element and Codex ACP on Linux. Other ACP adapters are configurable, but have not yet been verified end to end. See [compatibility and limits](docs/COMPATIBILITY.md).
+**Early working prototype.** Encrypted mentions, threaded answers, and contextual follow-ups across a bridge restart have been exercised with stock Element and Codex ACP on Linux. Grok Build has also been verified with encrypted threads, native non-interrupting steering, session continuation and Matrix MCP tools. Other ACP adapters remain configurable. See [compatibility and limits](docs/COMPATIBILITY.md).
 
 - Normal bot accounts on a compatible hosted or self-hosted Matrix server. No Matrix administrator token or server modification.
-- Your choice of ACP stdio agent, permission mode, workspace and credentials.
+- Your choice of ACP stdio agent, optional permission mode, workspace and credentials.
 - Encrypted messages, explicit operators and room audiences, optional cross-verification, and separate sessions per thread or room.
 - Optional manual or automatic tool approval, same-session steering, persistent sessions and a durable inbox/outbox.
 - Matrix history search with sender/date filters, full-thread reading, and image/file attachments.
@@ -89,7 +89,7 @@ For an additional fixed reader allowlist, use `audience_policy = "configured"` a
 
 Use additional `[[rooms]]` entries for more rooms. `conversation = "thread"` is the default; `"room"` uses one session for the entire room. Changing the actual harness/workspace/credentials still requires a fresh session binding; changing ordinary channel access in room-membership mode does not.
 
-A follow-up arriving during work steers the same ACP session: the bridge cancels the current turn and immediately resumes with only the new messages. This can interrupt a running tool. It does not enqueue a separate job or ask you to resend. An end-of-turn race is recovered durably as a continuation. `max_concurrent_runs = 0` removes the worker-wide concurrency limit; positive values limit independent conversations. No hidden model-token or turn-duration limit is imposed.
+A follow-up arriving during work steers the same ACP session: the bridge delivers only new messages using the configured non-interrupting strategy. Native steering reaches the running turn; the portable fallback waits for the turn to finish. It does not enqueue a separate job or ask you to resend. An end-of-turn race is recovered durably as a continuation. `max_concurrent_runs = 0` removes the worker-wide concurrency limit; positive values limit independent conversations. No hidden model-token or turn-duration limit is imposed.
 
 ## Matrix tools
 
@@ -118,3 +118,9 @@ cargo run --locked -- demo recovery
 ```
 
 The demos use deterministic in-memory ACP fixtures. They do not contact Matrix or a model. MIT licensed.
+
+### Follow-ups and providers
+
+Follow-ups do not interrupt tools. The portable default (`harness.steering = "after_turn"`) appends them after the current ACP prompt finishes. For Codex ACP, opt into `concurrent_prompt` to send follow-ups during the turn. For Grok Build use `grok_interject`; see the [Grok configuration](config/grok.toml) and [provider notes](docs/COMPATIBILITY.md#grok-build). `!bridge stop` remains an explicit cancellation.
+
+`harness.mode` is optional. If you set it, the bridge requires that exact advertised ACP mode. Agents without ACP modes retain their own permission settings; Matrix tool approvals still follow the room policy.

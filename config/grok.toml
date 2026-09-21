@@ -1,0 +1,22 @@
+# Grok Build: authenticate first with `grok login` on the worker.
+bot_user_id = "@agent:example.invalid"
+homeserver = "https://matrix.example.invalid"
+state_dir = "/home/agent/.local/share/matrix-acp-bridge/state"
+
+[harness]
+program = "/home/agent/.grok/bin/grok"
+args = ["agent", "stdio"]
+workspace = "/home/agent/projects"
+steering = "grok_interject"
+# No `mode`: Grok does not advertise ACP permission modes.
+[harness.env]
+HOME = "/home/agent"
+PATH = "/home/agent/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+[[rooms]]
+room_id = "!private-room:example.invalid"
+operators = ["@owner:example.invalid"]
+operator_trust = "account"
+audience_policy = "room_membership"
+conversation = "thread"
+tool_approval = "automatic"

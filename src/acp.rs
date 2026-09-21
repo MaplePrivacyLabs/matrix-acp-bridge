@@ -11,13 +11,14 @@ use std::{
 };
 
 use agent_client_protocol::{
-    Agent, Client, ConnectTo, ConnectionTo,
+    Agent, Client, ConnectTo, ConnectionTo, UntypedMessage,
     schema::{ProtocolVersion, v1::*},
 };
+use futures::{StreamExt, stream::FuturesUnordered};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    config::HarnessConfig,
+    config::{HarnessConfig, Steering},
     model::{AgentEvent, PermissionOption as Choice, Run, RunStatus},
 };
 
@@ -102,12 +103,15 @@ pub async fn inspect(
                         .collect()
                 })
                 .unwrap_or_default();
-            let mode_applied = modes.contains(&harness.mode);
-            if mode_applied {
+            let mode_applied = harness
+                .mode
+                .as_ref()
+                .is_none_or(|mode| modes.contains(mode));
+            if let Some(mode) = harness.mode.filter(|_| mode_applied) {
                 tokio::time::timeout(
                     Duration::from_secs(30),
                     connection
-                        .send_request(SetSessionModeRequest::new(session.session_id, harness.mode))
+                        .send_request(SetSessionModeRequest::new(session.session_id, mode))
                         .block_task(),
                 )
                 .await
@@ -167,7 +171,7 @@ pub async fn execute(
                         _ => None,
                     },
                     SessionUpdate::ToolCall(call) => Some(AgentEvent::Tool {run_id:notification_run.clone(),title:call.title}),
-                    SessionUpdate::CurrentModeUpdate(mode) if mode.current_mode_id.to_string() != required_mode => {
+                    SessionUpdate::CurrentModeUpdate(mode) if required_mode.as_ref().is_some_and(|required| mode.current_mode_id.to_string() != *required) => {
                         let _ = mode_fault.try_send(());
                         None
                     }
@@ -224,30 +228,56 @@ pub async fn execute(
                 let created = tokio::time::timeout(Duration::from_secs(30), connection.send_request(NewSessionRequest::new(harness.workspace.clone()).mcp_servers(mcp_servers.clone())).block_task()).await.map_err(|_|error("ACP session creation timed out"))??;
                 (created.session_id,created.modes)
             };
-            let modes = modes.ok_or_else(||error("agent must advertise the required permission mode"))?;
-            if !modes.available_modes.iter().any(|m|m.id.to_string() == harness.mode) { return Err(error("required permission mode is unavailable")); }
-            tokio::time::timeout(Duration::from_secs(30),connection.send_request(SetSessionModeRequest::new(session_id.clone(),harness.mode)).block_task()).await.map_err(|_|error("ACP mode change timed out"))??;
+            if let Some(mode) = harness.mode {
+                let modes = modes.ok_or_else(||error("agent must advertise the required permission mode"))?;
+                if !modes.available_modes.iter().any(|m|m.id.to_string() == mode) { return Err(error("required permission mode is unavailable")); }
+                tokio::time::timeout(Duration::from_secs(30),connection.send_request(SetSessionModeRequest::new(session_id.clone(),mode)).block_task()).await.map_err(|_|error("ACP mode change timed out"))??;
+            }
             *expected_session.lock().expect("session mutex poisoned") = Some(session_id.to_string());
             updates.send(AgentEvent::SessionReady {run_id:run.id.clone(),session_id:session_id.to_string()}).await.map_err(|_|error("controller closed"))?;
             let mut next_prompt = run.prompt.clone();
             let mut commands_open = true;
             let status = 'turns: loop {
                 active.store(true,Ordering::SeqCst);
-                let prompt = connection.send_request(PromptRequest::new(session_id.clone(),vec![ContentBlock::Text(TextContent::new(next_prompt))])).block_task();
-                tokio::pin!(prompt);
+                let (responses, mut prompt_responses) = mpsc::unbounded_channel();
+                let mut generation = 0_u64;
+                submit_prompt(&connection,session_id.clone(),next_prompt,generation,responses.clone())?;
                 let mut stopping = false;
                 let mut steering: Vec<(String,String)> = vec![];
+                let mut concurrent_inputs = Vec::new();
+                let mut interjections = FuturesUnordered::new();
+                let mut primary_outcome = None;
+                let mut needs_native_drain = false;
+                let mut drain = None;
                 let stop_deadline = tokio::time::sleep(Duration::from_secs(5));
                 tokio::pin!(stop_deadline);
                 let outcome = loop {
+                    if let Some(outcome) = primary_outcome
+                        && interjections.is_empty() {
+                            if needs_native_drain {
+                                if drain.is_none() {
+                                    drain = Some(Box::pin(drain_grok(connection.clone(), session_id.clone())));
+                                }
+                            } else { break outcome; }
+                    }
                     tokio::select! {
-                        response = &mut prompt => {
-                            let response = response?;
-                            break match response.stop_reason {
-                                StopReason::EndTurn => RunStatus::Completed,
-                                StopReason::Cancelled => RunStatus::Cancelled,
-                                _ => RunStatus::Failed,
-                            };
+                        Some((response_generation,response)) = prompt_responses.recv(), if primary_outcome.is_none() => {
+                            if response_generation != generation { continue; }
+                            primary_outcome = Some(prompt_status(response?));
+                            for event_id in std::mem::take(&mut concurrent_inputs) {
+                                updates.send(AgentEvent::Steered {run_id:run.id.clone(),event_id}).await.map_err(|_|error("controller closed"))?;
+                            }
+                        }
+                        Some(result) = interjections.next(), if !interjections.is_empty() => {
+                            let event_id = result?;
+                            needs_native_drain = true;
+                            drain = None;
+                            updates.send(AgentEvent::Steered {run_id:run.id.clone(),event_id}).await.map_err(|_|error("controller closed"))?;
+                        }
+                        result = async { drain.as_mut().expect("drain present").await }, if drain.is_some() => {
+                            result?;
+                            needs_native_drain = false;
+                            drain = None;
                         }
                         _ = mode_fault_rx.recv() => { return Err(error("agent changed the required permission mode during a turn")); }
                         _ = &mut stop_deadline, if stopping => { break RunStatus::Interrupted; }
@@ -259,16 +289,24 @@ pub async fn execute(
                                     let _ = entry.answer.send(option_id);
                                 }
                             }
-                            Some(Command::Steer {event_id,prompt}) => {
-                                steering.push((event_id,prompt));
-                                if !stopping {
-                                    stopping = true;
-                                    active.store(false,Ordering::SeqCst);
-                                    stop_deadline.as_mut().reset(tokio::time::Instant::now()+Duration::from_secs(5));
-                                    cancel_pending(&pending);
-                                    connection.send_notification(CancelNotification::new(session_id.clone()))?;
+                            Some(Command::Steer {event_id,prompt:text}) if !stopping => {
+                                drain = None;
+                                match harness.steering {
+                                    Steering::AfterTurn => steering.push((event_id,text)),
+                                    Steering::ConcurrentPrompt => {
+                                        // Codex resolves the newest prompt at turn completion;
+                                        // superseded requests may never resolve. Keep their
+                                        // callbacks alive: dropping an SDK response future
+                                        // would send $/cancel_request and interrupt the tool.
+                                        concurrent_inputs.push(event_id);
+                                        primary_outcome = None;
+                                        generation += 1;
+                                        submit_prompt(&connection,session_id.clone(),text,generation,responses.clone())?;
+                                    },
+                                    Steering::GrokInterject => interjections.push(interject_grok(connection.clone(),session_id.clone(),event_id,text)),
                                 }
                             }
+                            Some(Command::Steer {..}) => {},
                             Some(Command::Cancel) | None => {
                                 steering.clear();
                                 if !stopping {
@@ -283,14 +321,14 @@ pub async fn execute(
                         }
                     }
                 };
-                if !steering.is_empty() && matches!(outcome, RunStatus::Completed | RunStatus::Cancelled) {
+                if !stopping && !steering.is_empty() && outcome == RunStatus::Completed {
                     next_prompt = steering.iter().map(|(_,p)|p.as_str()).collect::<Vec<_>>().join("\n");
                     for (event_id,_) in steering {
                         updates.send(AgentEvent::Steered {run_id:run.id.clone(),event_id}).await.map_err(|_|error("controller closed"))?;
                     }
                     continue 'turns;
                 }
-                break outcome;
+                break if stopping && outcome == RunStatus::Completed {RunStatus::Cancelled} else {outcome};
             };
             active.store(false,Ordering::SeqCst);
             cancel_pending(&pending);
@@ -308,6 +346,112 @@ pub async fn execute(
             .await;
     }
     result.map_err(Into::into)
+}
+
+fn prompt_status(response: PromptResponse) -> RunStatus {
+    match response.stop_reason {
+        StopReason::EndTurn => RunStatus::Completed,
+        StopReason::Cancelled => RunStatus::Cancelled,
+        _ => RunStatus::Failed,
+    }
+}
+
+type PromptResult = (u64, agent_client_protocol::Result<PromptResponse>);
+
+fn submit_prompt(
+    connection: &ConnectionTo<Agent>,
+    session: SessionId,
+    text: String,
+    generation: u64,
+    responses: mpsc::UnboundedSender<PromptResult>,
+) -> agent_client_protocol::Result<()> {
+    connection
+        .send_request(PromptRequest::new(
+            session,
+            vec![ContentBlock::Text(TextContent::new(text))],
+        ))
+        .on_receiving_result(async move |result| {
+            // A superseded response can arrive after its turn driver has ended.
+            let _ = responses.send((generation, result));
+            Ok(())
+        })
+}
+
+async fn grok_request(
+    connection: &ConnectionTo<Agent>,
+    method: &str,
+    params: serde_json::Value,
+) -> agent_client_protocol::Result<serde_json::Value> {
+    let response = tokio::time::timeout(
+        Duration::from_secs(30),
+        connection
+            .send_request(UntypedMessage::new(method, params)?)
+            .block_task(),
+    )
+    .await
+    .map_err(|_| error("Grok extension request timed out"))??;
+    if response.get("error").is_some_and(|e| !e.is_null()) {
+        return Err(error("Grok extension rejected request"));
+    }
+    response
+        .get("result")
+        .cloned()
+        .filter(|r| !r.is_null())
+        .ok_or_else(|| error("Grok extension returned no result"))
+}
+
+async fn interject_grok(
+    connection: ConnectionTo<Agent>,
+    session: SessionId,
+    event_id: String,
+    text: String,
+) -> agent_client_protocol::Result<String> {
+    let response = grok_request(
+        &connection,
+        "_x.ai/interject",
+        serde_json::json!({"sessionId":session,"text":text,"interjectionId":event_id}),
+    )
+    .await?;
+    if response.get("status").and_then(|s| s.as_str()) != Some("queued") {
+        return Err(error("Grok did not acknowledge interjection"));
+    }
+    Ok(event_id)
+}
+
+/// An interjection racing the end of a Grok turn becomes a provider-owned follow-up.
+/// Keep receiving its output and permissions until that session is actually idle.
+/// The actor request is a mailbox barrier after the accepted interjection; the
+/// original prompt response alone is NOT proof that the follow-up has finished.
+async fn drain_grok(
+    connection: ConnectionTo<Agent>,
+    session: SessionId,
+) -> agent_client_protocol::Result<()> {
+    loop {
+        grok_request(
+            &connection,
+            "_x.ai/session/info",
+            serde_json::json!({"sessionId":session}),
+        )
+        .await?;
+        let response =
+            grok_request(&connection, "_x.ai/sessions/list", serde_json::json!({})).await?;
+        let row = response
+            .get("sessions")
+            .and_then(|s| s.as_array())
+            .and_then(|rows| {
+                rows.iter().find(|r| {
+                    r.get("sessionId").and_then(|s| s.as_str())
+                        == Some(session.to_string().as_str())
+                })
+            })
+            .ok_or_else(|| error("Grok session absent from active session roster"))?;
+        match row.get("activity").and_then(|v| v.as_str()) {
+            Some("idle" | "completed") => return Ok(()),
+            Some("working" | "needs_input") => {}
+            _ => return Err(error("Grok session stopped before interjection completed")),
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 /// Live stdio transport, also used by the explicit ACP-only doctor command.

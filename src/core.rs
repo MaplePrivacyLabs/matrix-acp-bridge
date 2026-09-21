@@ -490,11 +490,14 @@ impl Bridge {
                 }
             }
             AgentEvent::Steered { event_id, .. } => {
-                flush_run(&tx, &run, now)?;
+                // Native steering is input admission, not an output or permission
+                // boundary. In particular it must not split a streamed sentence
+                // or invalidate a tool permission that is still being answered.
+                if self.config.harness.steering == crate::config::Steering::AfterTurn {
+                    flush_run(&tx, &run, now)?;
+                }
                 tx.execute("UPDATE context_batches SET state='inflight' WHERE input=?1 AND run=?2 AND state='pending'",params![event_id,run.id])?;
                 tx.execute("UPDATE run_steers SET status='delivered' WHERE event=?1 AND run=?2 AND status='pending'", params![event_id,run.id])?;
-                tx.execute("UPDATE approvals SET consumed=1 WHERE run=?1", [&run.id])?;
-                tx.execute("UPDATE runs SET status='running' WHERE id=?1", [&run.id])?;
             }
             AgentEvent::Finished { status, .. } => {
                 ensure!(!status.active(), "completion must have a terminal status");

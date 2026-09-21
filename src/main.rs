@@ -134,7 +134,9 @@ async fn main() -> Result<()> {
                 report.can_resume,
                 "agent cannot load/resume sessions; thread follow-ups require it"
             );
-            println!("Configured mode applied. No prompt was sent; no Matrix connection was made.");
+            println!(
+                "ACP configuration verified. No prompt was sent; no Matrix connection was made."
+            );
         }
         Commands::Check { config, json } => {
             let config = Config::parse(&std::fs::read_to_string(config)?)?;

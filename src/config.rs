@@ -41,8 +41,29 @@ pub struct HarnessConfig {
     /// Explicit child environment only. Never inherit the bridge environment.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// Required mode. A backend that cannot apply it is rejected.
-    pub mode: String,
+    /// Optional ACP mode. When set, the agent must advertise and apply it.
+    /// Omit for agents that configure permissions outside ACP modes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Steering::is_after_turn")]
+    pub steering: Steering,
+}
+
+/// Provider-specific delivery is explicit; ordinary ACP never receives concurrent prompts.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Steering {
+    #[default]
+    AfterTurn,
+    /// Codex ACP accepts another prompt as input to its running turn.
+    ConcurrentPrompt,
+    /// Grok Build's native safe-point interjection, including late-turn drainage.
+    GrokInterject,
+}
+impl Steering {
+    fn is_after_turn(&self) -> bool {
+        *self == Self::AfterTurn
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -161,8 +182,11 @@ impl Config {
             "harness program and workspace must be absolute"
         );
         ensure!(
-            !self.harness.mode.trim().is_empty(),
-            "an explicit harness mode is required"
+            self.harness
+                .mode
+                .as_ref()
+                .is_none_or(|mode| !mode.trim().is_empty()),
+            "omit harness mode instead of providing an empty value"
         );
         ensure!(
             !self.rooms.is_empty(),

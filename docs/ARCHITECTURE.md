@@ -46,13 +46,13 @@ The Matrix adapter first fetches the raw `/sync` response using the official cli
 
 First sync establishes a baseline without running historical prompts. Later timeline gaps and undecryptable events hold the staged batch instead of advancing past it. A limited timeline can backfill up to 500 events to the last checkpointed room event. Missing continuity retains the staged cursor; richer recovery UX is still needed. The current implementation favors a visible stop over silently dropping work.
 
-Assistant text chunks are journaled and coalesced until a tool, permission, continuation or terminal-turn event. There is no periodic text flush. Explicit recovery preserves any buffered text before marking an interrupted run. Outbound messages have persistent transaction IDs. Uncertain HTTP sends retry with the same ID; successfully acknowledged sends are marked delivered. This does not give exactly-once external agent side effects. Restart marks queued/running/waiting/cancelling runs interrupted, cancels approvals and requires human review before new instructions.
+Assistant text chunks are journaled and coalesced until a tool, permission, after-turn continuation or terminal-turn event. There is no periodic text flush. Explicit recovery preserves any buffered text before marking an interrupted run. Outbound messages have persistent transaction IDs. Uncertain HTTP sends retry with the same ID; successfully acknowledged sends are marked delivered. This does not give exactly-once external agent side effects. Restart marks queued/running/waiting/cancelling runs interrupted, cancels approvals and requires human review before new instructions.
 
 The journal contains decrypted prompts and output; private directory permissions are not disk encryption. The Matrix crypto store separately requires a passphrase. Backups and retention must protect both stores.
 
 ## ACP behavior
 
-The client uses stable protocol-v1 entrypoints and advertised capabilities. It loads a stored session when supported, otherwise uses advertised resume support, otherwise refuses to pretend context survived. It requires an advertised permission mode and an acknowledged mode-setting request before the prompt. Client-provided filesystem and terminal capabilities remain disabled.
+The client uses stable protocol-v1 entrypoints and advertised capabilities. It loads a stored session when supported, otherwise uses advertised resume support, otherwise refuses to pretend context survived. When a mode is configured, it requires that advertised mode and an acknowledged mode-setting request before the prompt. Omitting the mode preserves the agent's own permission setup. Client-provided filesystem and terminal capabilities remain disabled.
 
 Permission callbacks release the SDK dispatch loop while waiting for a human. Blocking that loop would prevent cancellation and other incoming traffic. Responses preserve actual offered option IDs; unknown choices never become approval. An explicit room or conversation policy can consume an offered allow_once choice automatically, with a durable decision record. An offered persistent allow choice is a fallback when no allow-once choice exists. A cancellation request also closes approval admission.
 
@@ -60,7 +60,7 @@ Normal model turns have no artificial duration or output-token cap. Initializati
 
 The running Matrix SDK client also serves read-only MCP tools over a private Unix socket. ACP new/load/resume requests receive a stdio proxy server automatically. Search paginates server history and decrypts through that same device store; no second Matrix login is created.
 
-Active-thread instructions are journaled as steering. The ACP client cancels the active prompt and resumes the same session with new message lines. If completion wins the race, the journal creates one immediate continuation. Explicit stop and restart discard pending steering instead of replaying work.
+Active-thread instructions are journaled as steering. The ACP client delivers new message lines using the configured strategy: after-turn continuation, concurrent prompts for explicitly compatible providers, or Grok Build native interjection. Only explicit cancellation sends `session/cancel`. Grok interjection acknowledgements do not mean the turn is over; an actor mailbox barrier plus session-activity checks keeps the transport alive for interjections that become provider-owned continuations. If completion wins the race, the journal creates one immediate continuation. Explicit stop and restart discard pending steering instead of replaying work.
 
 ## References inspected
 

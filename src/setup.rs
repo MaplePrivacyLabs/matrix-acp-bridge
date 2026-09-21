@@ -117,7 +117,7 @@ fn gather(
         let mode = ask(
             input,
             output,
-            "ACP permission mode (adapter-specific; doctor will list modes)",
+            "ACP mode (optional; leave blank for agent defaults)",
             "",
         )?;
         HarnessConfig {
@@ -131,7 +131,8 @@ fn gather(
             ],
             workspace: "/var/lib/matrix-acp-agent/workspace".into(),
             env: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
-            mode,
+            mode: (!mode.is_empty()).then_some(mode),
+            steering: Default::default(),
         }
     } else {
         let program = path(ask(input, output, "ACP executable (absolute path)", "")?)?;
@@ -151,7 +152,7 @@ fn gather(
         let mode = ask(
             input,
             output,
-            "ACP permission mode (adapter-specific; doctor will list modes)",
+            "ACP mode (optional; leave blank for agent defaults)",
             "",
         )?;
         let home = path(ask(
@@ -170,7 +171,8 @@ fn gather(
             program,
             args,
             workspace,
-            mode,
+            mode: (!mode.is_empty()).then_some(mode),
+            steering: Default::default(),
             env: BTreeMap::from([
                 ("HOME".into(), home.to_string_lossy().into_owned()),
                 ("PATH".into(), search_path),

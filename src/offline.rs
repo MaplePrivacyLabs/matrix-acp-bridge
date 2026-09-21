@@ -1,8 +1,11 @@
 //! Deterministic protocol fixture. No AI, tools, subprocesses, credentials or network.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
-use agent_client_protocol::{Agent, Client, DynConnectTo, schema::v1::*};
+use agent_client_protocol::{Agent, Client, DynConnectTo, UntypedMessage, schema::v1::*};
 use serde_json::json;
 use tokio::sync::Notify;
 
@@ -12,6 +15,10 @@ pub enum Behavior {
     Approval,
     WaitForCancel,
     SteerThenReply,
+    CodexSteer,
+    GrokInterject,
+    GrokLate,
+    NoModes,
     RejectMode,
     WrongSession,
     ChangeMode,
@@ -24,12 +31,18 @@ pub struct Observations {
     pub new_sessions: usize,
     pub decisions: Vec<String>,
     pub client_tools_disabled: bool,
+    pub cancellations: usize,
+    pub interjections: Vec<String>,
+    pub tool_finished: bool,
+    pub roster_checks: usize,
 }
 
 #[derive(Clone)]
 pub struct FixtureAgent {
     pub behavior: Behavior,
     pub observations: Arc<Mutex<Observations>>,
+    pub release_tool: Arc<Notify>,
+    pub finish_native: Arc<AtomicBool>,
 }
 
 impl FixtureAgent {
@@ -37,6 +50,8 @@ impl FixtureAgent {
         Self {
             behavior,
             observations: Arc::default(),
+            release_tool: Arc::default(),
+            finish_native: Arc::default(),
         }
     }
 
@@ -46,6 +61,10 @@ impl FixtureAgent {
         let obs_load = self.observations.clone();
         let obs_prompt = self.observations.clone();
         let behavior = self.behavior;
+        let release_tool = self.release_tool.clone();
+        let obs_cancel = self.observations.clone();
+        let obs_ext = self.observations.clone();
+        let finish_native = self.finish_native.clone();
         let cancelled = Arc::new(Notify::new());
         let cancel_prompt = cancelled.clone();
         DynConnectTo::new(Agent.builder()
@@ -60,7 +79,9 @@ impl FixtureAgent {
             .on_receive_request(async move |_request: NewSessionRequest,responder,_cx| {
                 let mut obs = obs_new.lock().expect("fixture lock");
                 obs.new_sessions += 1;
-                let response: NewSessionResponse = serde_json::from_value(json!({"sessionId":format!("fixture-{}",obs.new_sessions),"modes":modes()})).expect("valid fixture");
+                let mut value=json!({"sessionId":format!("fixture-{}",obs.new_sessions)});
+                if !matches!(behavior,Behavior::NoModes) { value["modes"]=modes(); }
+                let response: NewSessionResponse = serde_json::from_value(value).expect("valid fixture");
                 responder.respond(response)
             },agent_client_protocol::on_receive_request!())
             .on_receive_request(async move |request: LoadSessionRequest,responder,cx| {
@@ -73,6 +94,7 @@ impl FixtureAgent {
                 else { responder.respond(SetSessionModeResponse::default()) }
             },agent_client_protocol::on_receive_request!())
             .on_receive_notification(async move |_notification: CancelNotification,_cx| {
+                obs_cancel.lock().unwrap().cancellations += 1;
                 cancelled.notify_one();
                 Ok(())
             },agent_client_protocol::on_receive_notification!())
@@ -80,14 +102,33 @@ impl FixtureAgent {
                 let obs_prompt = obs_prompt.clone();
                 let cancel_prompt = cancel_prompt.clone();
                 let prompt_cx = cx.clone();
+                let release_tool = release_tool.clone();
                 cx.spawn(async move {
                 let cx = prompt_cx;
                 let text = request.prompt.iter().filter_map(|block|match block {ContentBlock::Text(t)=>Some(t.text.as_str()),_=>None}).collect::<Vec<_>>().join("\n");
                 obs_prompt.lock().expect("fixture lock").prompts.push(text.clone());
                 let session = request.session_id.clone();
-                if matches!(behavior,Behavior::WaitForCancel) || (matches!(behavior,Behavior::SteerThenReply) && obs_prompt.lock().expect("fixture lock").prompts.len() == 1) {
+                if matches!(behavior,Behavior::WaitForCancel) {
                     cancel_prompt.notified().await;
                     return responder.respond(PromptResponse::new(StopReason::Cancelled));
+                }
+                if matches!(behavior,Behavior::SteerThenReply | Behavior::CodexSteer | Behavior::GrokInterject | Behavior::GrokLate) && obs_prompt.lock().unwrap().prompts.len()==1 {
+                    // A deterministic running tool: only the test can release it.
+                    cx.send_notification(SessionNotification::new(session.clone(),SessionUpdate::ToolCall(ToolCall::new("held-tool","Fixture running tool"))))?;
+                    tokio::select! {
+                        _ = release_tool.notified() => { obs_prompt.lock().unwrap().tool_finished=true; },
+                        _ = cancel_prompt.notified() => { return responder.respond(PromptResponse::new(StopReason::Cancelled)); }
+                    }
+                }
+                if matches!(behavior,Behavior::CodexSteer) {
+                    if text == "original work" {
+                        if responder.cancellation().is_cancelled() {
+                            obs_prompt.lock().unwrap().cancellations += 1;
+                        }
+                        futures::future::pending::<()>().await;
+                    } else {
+                        while !obs_prompt.lock().unwrap().tool_finished {tokio::task::yield_now().await;}
+                    }
                 }
                 if matches!(behavior,Behavior::ChangeMode) {
                     cx.send_notification(SessionNotification::new(session.clone(),SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new("full-access"))))?;
@@ -108,6 +149,27 @@ impl FixtureAgent {
                 }
                 responder.respond(PromptResponse::new(StopReason::EndTurn))
                 })
+            },agent_client_protocol::on_receive_request!())
+            .on_receive_request(async move |request: UntypedMessage,responder,cx| {
+                if !matches!(behavior,Behavior::GrokInterject | Behavior::GrokLate) { return responder.respond_with_error(agent_client_protocol::Error::method_not_found()); }
+                let value=match request.method.as_str() {
+                    "_x.ai/interject" => {
+                        obs_ext.lock().unwrap().interjections.push(request.params["text"].as_str().unwrap().to_owned());
+                        json!({"status":"queued"})
+                    },
+                    "_x.ai/session/info" => json!({}),
+                    "_x.ai/sessions/list" => {
+                        let mut obs=obs_ext.lock().unwrap();
+                        obs.roster_checks += 1;
+                        let idle=obs.tool_finished && (!matches!(behavior,Behavior::GrokLate) || finish_native.load(Ordering::SeqCst));
+                        if idle && matches!(behavior,Behavior::GrokLate) {
+                            cx.send_notification(SessionNotification::new("fixture-1",SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new("Late follow-up response"))))))?;
+                        }
+                        json!({"sessions":[{"sessionId":"fixture-1","activity":if idle {"idle"} else {"working"}}]})
+                    },
+                    _ => return responder.respond_with_error(agent_client_protocol::Error::method_not_found()),
+                };
+                responder.respond(json!({"result":value}))
             },agent_client_protocol::on_receive_request!()))
     }
 }
