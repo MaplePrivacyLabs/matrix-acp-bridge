@@ -426,16 +426,12 @@ impl Bridge {
                     params![run.id, text],
                 )?;
             }
-            AgentEvent::Tool { title, .. } => {
+            AgentEvent::Tool { .. } => {
                 // A tool call ends the preceding assistant text segment. Timer
                 // ticks are not message boundaries: they can split a sentence.
+                // Publish only text the agent chose to send, not synthesized
+                // tool notices. ACP reasoning and tool results stay off chat.
                 flush_run(&tx, &run, now)?;
-                enqueue(
-                    &tx,
-                    &run.conversation.key,
-                    &format!("Working: {title}"),
-                    now,
-                )?;
             }
             AgentEvent::Permission {
                 request_id,

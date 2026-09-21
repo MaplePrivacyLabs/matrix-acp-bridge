@@ -52,7 +52,7 @@ async fn timer_between_streaming_chunks_does_not_split_a_short_reply() {
 }
 
 #[tokio::test]
-async fn tool_boundary_delivers_complete_progress_before_the_tool_and_final_reply() {
+async fn tool_boundary_preserves_agent_messages_without_synthetic_tool_notices() {
     let (mut runner, _) = fixture(matrix_acp_bridge::offline::Behavior::Reply);
     let run = start(&mut runner.bridge, "one");
     text(&mut runner.bridge, &run, "I'll check ");
@@ -68,18 +68,35 @@ async fn tool_boundary_delivers_complete_progress_before_the_tool_and_final_repl
             103,
         )
         .unwrap();
-    assert_eq!(
-        replies(&runner.bridge),
-        vec!["I'll check the tests.", "Working: Run tests"]
-    );
+    assert_eq!(replies(&runner.bridge), vec!["I'll check the tests."]);
     text(&mut runner.bridge, &run, "All ");
     runner.tick(104).await.unwrap();
     text(&mut runner.bridge, &run, "passed.");
     finish_run(&mut runner.bridge, &run);
     assert_eq!(
         replies(&runner.bridge),
-        vec!["I'll check the tests.", "Working: Run tests", "All passed."]
+        vec!["I'll check the tests.", "All passed."]
     );
+}
+
+#[test]
+fn tool_calls_without_assistant_text_do_not_publish_chat_messages() {
+    let mut bridge = bridge();
+    let run = start(&mut bridge, "one");
+    for title in ["search_tool", "use_tool", "Run tests"] {
+        bridge
+            .agent_event(
+                AgentEvent::Tool {
+                    run_id: run.clone(),
+                    title: title.into(),
+                },
+                103,
+            )
+            .unwrap();
+        assert!(replies(&bridge).is_empty());
+    }
+    finish_run(&mut bridge, &run);
+    assert!(replies(&bridge).is_empty());
 }
 
 #[test]
