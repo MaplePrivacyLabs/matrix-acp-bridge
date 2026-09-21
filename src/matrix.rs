@@ -382,6 +382,7 @@ impl MatrixAdapter {
         for message in runner.bridge.store.pending()? {
             let snapshot = self.snapshot(&message.conversation.room_id).await?;
             if !runner.bridge.may_deliver(&message, &snapshot)? {
+                runner.block_message(&message.transaction_id)?;
                 continue;
             }
             let event_id = self.send(&message).await?;

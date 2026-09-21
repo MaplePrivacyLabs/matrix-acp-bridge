@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 use rusqlite::{OptionalExtension, params};
 
 use crate::{
-    config::{Config, ConversationMode, OperatorTrust, ToolApproval, digest},
+    config::{Config, ConversationMode, MessageDelivery, OperatorTrust, ToolApproval, digest},
     model::*,
     store::{Store, enqueue, enqueue_reaction},
 };
@@ -14,6 +14,40 @@ pub struct Bridge {
 }
 
 impl Bridge {
+    pub fn explicit_message(
+        &mut self,
+        run_id: &str,
+        text: &str,
+        now: i64,
+    ) -> Result<(Conversation, Vec<String>)> {
+        ensure!(!text.trim().is_empty(), "message text must not be empty");
+        let run = self
+            .store
+            .run(run_id)?
+            .ok_or_else(|| anyhow::anyhow!("unknown run"))?;
+        ensure!(
+            matches!(run.status, RunStatus::Running | RunStatus::WaitingApproval),
+            "sending session is no longer active"
+        );
+        ensure!(
+            self.config
+                .room(&run.conversation.room_id)
+                .is_some_and(|p| p.message_delivery == MessageDelivery::Explicit),
+            "explicit sending is not enabled for this conversation"
+        );
+        let tx = self.store.db.transaction()?;
+        crate::context_ledger::observed(&tx, &run.id)?;
+        let ids = crate::store::enqueue_ids(&tx, &run.conversation.key, text, now)?;
+        for id in &ids {
+            tx.execute(
+                "INSERT INTO explicit_outbox VALUES(?1,?2)",
+                params![id, run.id],
+            )?;
+        }
+        tx.commit()?;
+        Ok((run.conversation, ids))
+    }
+
     pub fn new(config: Config, store: Store) -> Result<Self> {
         config.validate()?;
         Ok(Self { config, store })
@@ -139,8 +173,17 @@ impl Bridge {
         history: &[Incoming],
     ) -> Result<crate::context::Prepared> {
         let conversation = self.conversation(event);
-        let (known, initial) = crate::context_ledger::known(&self.store.db, &conversation.key)?;
-        crate::context::prepare(&self.config, event, history, &known, initial)
+        let (known, initial, delivery) =
+            crate::context_ledger::known(&self.store.db, &conversation.key)?;
+        let mut prepared = crate::context::prepare(&self.config, event, history, &known, initial)?;
+        if !initial && delivery.as_deref() != Some(prepared.delivery.as_str()) {
+            let instruction = match prepared.delivery {
+                MessageDelivery::Explicit => crate::context::EXPLICIT_SEND_INSTRUCTIONS,
+                MessageDelivery::Automatic => "Your assistant text is posted to the Matrix thread.",
+            };
+            prepared.prompt = format!("{instruction}\n\n{}", prepared.prompt);
+        }
+        Ok(prepared)
     }
 
     pub fn handle(&mut self, event: &Incoming, room: &RoomSnapshot, now: i64) -> Result<Handled> {
@@ -421,10 +464,16 @@ impl Bridge {
                 )?;
             }
             AgentEvent::Text { text, .. } => {
-                tx.execute(
-                    "INSERT INTO output(run,body) VALUES(?1,?2)",
-                    params![run.id, text],
-                )?;
+                if self
+                    .config
+                    .room(&run.conversation.room_id)
+                    .is_some_and(|p| p.message_delivery == MessageDelivery::Automatic)
+                {
+                    tx.execute(
+                        "INSERT INTO output(run,body) VALUES(?1,?2)",
+                        params![run.id, text],
+                    )?;
+                }
             }
             AgentEvent::Tool { .. } => {
                 // A tool call ends the preceding assistant text segment. Timer

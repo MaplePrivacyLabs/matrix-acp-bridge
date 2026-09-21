@@ -1,4 +1,4 @@
-//! Read-only Matrix tools over a local Unix socket, exposed through the official
+//! Matrix read tools and scoped explicit sending over a local Unix socket, exposed through the official
 //! MCP SDK. The live bridge owns the Matrix client/crypto store; tool processes
 //! proxy stdio and never open a second copy of that device store.
 use std::{
@@ -26,19 +26,28 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
 };
 
 use crate::{
     config::{Config, digest},
     matrix::{MatrixAdapter, decode},
+    messaging::SendHub,
 };
 
 #[derive(Clone)]
 pub struct MatrixTools {
     config: Config,
     adapter: MatrixAdapter,
+    sender: Option<(SendHub, String)>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SendMessage {
+    /// The exact message to publish to the current Matrix thread.
+    pub text: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -113,7 +122,11 @@ fn describe(room: &str, event: &TimelineEvent) -> Result<Option<Value>> {
 
 impl MatrixTools {
     pub fn new(config: Config, adapter: MatrixAdapter) -> Self {
-        Self { config, adapter }
+        Self {
+            config,
+            adapter,
+            sender: None,
+        }
     }
     async fn room(&self, id: &str) -> Result<Room> {
         let policy = self
@@ -299,6 +312,20 @@ pub fn matches_search(
 #[tool_router]
 impl MatrixTools {
     #[tool(
+        description = "Send a message to the people in this session's current Matrix thread. Use this when you want to communicate; ordinary assistant output is not posted in explicit mode. No room or thread IDs are needed. Returns Matrix event IDs only after delivery is acknowledged; sending does not end your work."
+    )]
+    async fn send_message_to_thread(
+        &self,
+        Parameters(request): Parameters<SendMessage>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (hub, scope) = self
+            .sender
+            .as_ref()
+            .ok_or_else(|| error("explicit sending is not enabled for this session"))?;
+        let receipt = hub.send(scope, request.text).await.map_err(error)?;
+        Ok(result(serde_json::to_value(receipt).map_err(error)?))
+    }
+    #[tool(
         description = "List Matrix channels available to this bot. These are Matrix rooms, not Slack channels."
     )]
     async fn matrix_rooms(&self) -> Result<CallToolResult, ErrorData> {
@@ -428,7 +455,11 @@ impl ServerHandler for MatrixTools {
     }
 }
 
-pub async fn listen(config: Config, adapter: MatrixAdapter) -> Result<tokio::task::JoinHandle<()>> {
+pub async fn listen(
+    config: Config,
+    adapter: MatrixAdapter,
+    hub: SendHub,
+) -> Result<tokio::task::JoinHandle<()>> {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     let path = config.tools_socket_path();
     if let Ok(meta) = std::fs::symlink_metadata(&path) {
@@ -443,8 +474,28 @@ pub async fn listen(config: Config, adapter: MatrixAdapter) -> Result<tokio::tas
     let server = MatrixTools::new(config, adapter);
     Ok(tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
-            let server = server.clone();
+            let mut server = server.clone();
+            let hub = hub.clone();
             tokio::spawn(async move {
+                let mut stream = BufReader::new(stream);
+                let mut header = String::new();
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    (&mut stream).take(256).read_line(&mut header),
+                )
+                .await;
+                if !matches!(read, Ok(Ok(_))) || !header.ends_with('\n') {
+                    return;
+                }
+                let Ok(scope) = serde_json::from_str::<Option<String>>(&header) else {
+                    return;
+                };
+                if let Some(scope) = scope {
+                    if !hub.valid(&scope) {
+                        return;
+                    }
+                    server.sender = Some((hub, scope));
+                }
                 if let Ok(service) = server.serve(stream).await {
                     let _ = service.waiting().await;
                 }
@@ -453,8 +504,11 @@ pub async fn listen(config: Config, adapter: MatrixAdapter) -> Result<tokio::tas
     }))
 }
 
-pub async fn proxy(path: &Path) -> Result<()> {
-    let stream = UnixStream::connect(path).await?;
+pub async fn proxy(path: &Path, scope: Option<&str>) -> Result<()> {
+    let mut stream = UnixStream::connect(path).await?;
+    stream
+        .write_all(format!("{}\n", serde_json::to_string(&scope)?).as_bytes())
+        .await?;
     let (mut reader, mut writer) = stream.into_split();
     let input = async {
         tokio::io::copy(&mut tokio::io::stdin(), &mut writer).await?;
@@ -469,18 +523,25 @@ pub async fn proxy(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn agent_server(socket: PathBuf) -> agent_client_protocol::schema::v1::McpServer {
+pub fn agent_server(
+    socket: PathBuf,
+    scope: Option<&str>,
+) -> agent_client_protocol::schema::v1::McpServer {
     use agent_client_protocol::schema::v1::{McpServer, McpServerStdio};
+    let mut args = vec![
+        "tools".into(),
+        "--socket".into(),
+        socket.to_string_lossy().into_owned(),
+    ];
+    if let Some(scope) = scope {
+        args.extend(["--send-scope".into(), scope.into()]);
+    }
     McpServer::Stdio(
         McpServerStdio::new(
             "matrix",
             std::env::current_exe().expect("bridge executable path"),
         )
-        .args(vec![
-            "tools".into(),
-            "--socket".into(),
-            socket.to_string_lossy().into_owned(),
-        ]),
+        .args(args),
     )
 }
 
@@ -527,7 +588,8 @@ mod tests {
                     "matrix_search",
                     "matrix_thread",
                     "matrix_context",
-                    "matrix_attachment"
+                    "matrix_attachment",
+                    "send_message_to_thread"
                 ]
                 .map(str::to_owned)
             )

@@ -513,6 +513,7 @@ async fn one_step(adapter: &MatrixAdapter, runner: &mut Runner) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(15), adapter.deliver(runner))
         .await
         .context("Matrix delivery timed out")??;
+    runner.poll_messages(now())?;
     Ok(())
 }
 
@@ -524,14 +525,20 @@ pub async fn run(config: Config, retry_event: Option<&str>) -> Result<()> {
     }
     let client = restore_client(&config).await?;
     let adapter = MatrixAdapter::from_client(&config, client)?;
-    let tools_server = crate::matrix_tools::listen(config.clone(), adapter.clone()).await?;
-    let mcp_server = crate::matrix_tools::agent_server(config.tools_socket_path());
+    let (hub, requests) = crate::messaging::SendHub::new();
+    let tools_server =
+        crate::matrix_tools::listen(config.clone(), adapter.clone(), hub.clone()).await?;
+    let socket = config.tools_socket_path();
     let bridge = Bridge::new(config, store)?;
     let mut runner = Runner::new(
         bridge,
         Arc::new(|h| DynConnectTo::new(ScopedProcess(h.clone()))),
     )
-    .with_mcp_servers(vec![mcp_server]);
+    .with_messaging(
+        hub,
+        requests,
+        Arc::new(move |_, scope| vec![crate::matrix_tools::agent_server(socket.clone(), scope)]),
+    );
     if let Some(event_id) = retry_event {
         let event = configured_event(adapter.client(), &runner.bridge.config, event_id).await?;
         let snapshot = adapter.snapshot(&event.room_id).await?;

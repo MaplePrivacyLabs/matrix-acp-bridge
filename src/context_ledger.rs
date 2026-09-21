@@ -10,6 +10,17 @@ pub fn initialize(db: &Connection) -> Result<()> {
         run TEXT NOT NULL REFERENCES runs(id), events TEXT NOT NULL, initial INTEGER NOT NULL,
         state TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS context_sessions(conversation TEXT PRIMARY KEY REFERENCES conversations(key), session TEXT);")?;
+    let columns = {
+        let mut stmt = db.prepare("PRAGMA table_info(context_batches)")?;
+        stmt.query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if !columns.iter().any(|c| c == "delivery") {
+        db.execute(
+            "ALTER TABLE context_batches ADD COLUMN delivery TEXT NOT NULL DEFAULT 'automatic'",
+            [],
+        )?;
+    }
     let migrated: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM meta WHERE key='context-ledger-v1')",
         [],
@@ -34,7 +45,7 @@ pub fn initialize(db: &Connection) -> Result<()> {
         }
         if !events.is_empty() {
             db.execute(
-                "INSERT OR IGNORE INTO context_batches VALUES(?1,?2,?3,?4,?5,'delivered')",
+                "INSERT OR IGNORE INTO context_batches(input,conversation,run,events,initial,state) VALUES(?1,?2,?3,?4,?5,'delivered')",
                 params![
                     input.unwrap_or_else(|| format!("legacy:{run}")),
                     conversation,
@@ -55,7 +66,7 @@ pub fn initialize(db: &Connection) -> Result<()> {
         let initial = !events.is_empty();
         events.insert(input.clone());
         db.execute(
-            "INSERT OR IGNORE INTO context_batches VALUES(?1,?2,?3,?4,?5,'delivered')",
+            "INSERT OR IGNORE INTO context_batches(input,conversation,run,events,initial,state) VALUES(?1,?2,?3,?4,?5,'delivered')",
             params![
                 input,
                 conversation,
@@ -102,7 +113,10 @@ fn legacy_events(prompt: &str) -> BTreeSet<String> {
     events
 }
 
-pub fn known(db: &Connection, conversation: &str) -> Result<(BTreeSet<String>, bool)> {
+pub fn known(
+    db: &Connection,
+    conversation: &str,
+) -> Result<(BTreeSet<String>, bool, Option<String>)> {
     let current: Option<Option<String>> = db
         .query_row(
             "SELECT session FROM conversations WHERE key=?1",
@@ -119,17 +133,23 @@ pub fn known(db: &Connection, conversation: &str) -> Result<(BTreeSet<String>, b
         .optional()?;
     // An explicit session reset gets a fresh baseline, not a stale seen ledger.
     if tracked.is_some() && tracked != current {
-        return Ok((BTreeSet::new(), true));
+        return Ok((BTreeSet::new(), true, None));
     }
     let mut seen = BTreeSet::new();
     let mut initialized = false;
-    let mut stmt=db.prepare("SELECT b.events,b.initial FROM context_batches b JOIN runs r ON r.id=b.run WHERE b.conversation=?1 AND (b.state='delivered' OR (b.state IN ('pending','inflight') AND r.status IN ('queued','running','waiting_approval','cancelling')) OR (b.state='pending' AND r.status IN ('completed','cancelled') AND EXISTS(SELECT 1 FROM run_steers s WHERE s.event=b.input AND s.status='pending')))")?;
+    let mut delivery = None;
+    let mut stmt=db.prepare("SELECT b.events,b.initial,b.delivery FROM context_batches b JOIN runs r ON r.id=b.run WHERE b.conversation=?1 AND (b.state='delivered' OR (b.state IN ('pending','inflight') AND r.status IN ('queued','running','waiting_approval','cancelling')) OR (b.state='pending' AND r.status IN ('completed','cancelled') AND EXISTS(SELECT 1 FROM run_steers s WHERE s.event=b.input AND s.status='pending'))) ORDER BY b.rowid")?;
     for row in stmt.query_map([conversation], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, bool>(1)?,
+            r.get::<_, String>(2)?,
+        ))
     })? {
-        let (events, initial) = row?;
+        let (events, initial, mode) = row?;
         seen.extend(serde_json::from_str::<Vec<String>>(&events)?);
         initialized |= initial;
+        delivery = Some(mode);
     }
     if initialized {
         // Agent replies are already in this ACP session; do not echo Matrix copies.
@@ -139,7 +159,7 @@ pub fn known(db: &Connection, conversation: &str) -> Result<(BTreeSet<String>, b
                 .collect::<rusqlite::Result<Vec<_>>>()?,
         );
     }
-    Ok((seen, !initialized))
+    Ok((seen, !initialized, delivery))
 }
 
 pub fn stage(
@@ -173,14 +193,15 @@ pub fn stage(
         params![conversation, current],
     )?;
     db.execute(
-        "INSERT INTO context_batches VALUES(?1,?2,?3,?4,?5,?6)",
+        "INSERT INTO context_batches(input,conversation,run,events,initial,state,delivery) VALUES(?1,?2,?3,?4,?5,?6,?7)",
         params![
             input,
             conversation,
             run,
             serde_json::to_string(&prepared.events)?,
             prepared.initial,
-            if steering { "pending" } else { "inflight" }
+            if steering { "pending" } else { "inflight" },
+            prepared.delivery.as_str()
         ],
     )?;
     Ok(())

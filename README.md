@@ -95,6 +95,10 @@ A follow-up arriving during work steers the same ACP session: the bridge deliver
 
 The bridge automatically supplies five read tools to the ACP agent: `matrix_rooms`, `matrix_search`, `matrix_thread`, `matrix_context`, and `matrix_attachment`. Search supports text, sender ID, inclusive `after` and exclusive `before` dates/timestamps, a thread filter, and pagination. It scans all accessible channel history, not just messages seen since startup. Dates without times mean midnight UTC.
 
+Set `message_delivery = "explicit"` in a `[[rooms]]` entry to publish only intentional `send_message_to_thread({"text":"..."})` calls. The bridge supplies the current thread; the model does not provide routing IDs. Assistant narration and final text stay in the ACP session. The tool returns Matrix event IDs after server acknowledgement, and the agent can continue working after sending. Status reactions and necessary manual approval requests remain visible. Long messages use multiple Matrix events; a receipt lists them all. Network retries reuse stored transaction IDs. A new model tool invocation is a new send, not an idempotent retry of an earlier invocation.
+
+The first session input includes: “Your assistant output is not posted to Matrix. Use `send_message_to_thread` when you want to communicate with the people in this thread. You may continue working without sending a message.” In room-membership mode, changing delivery mode updates an existing session with this instruction once; later inputs remain just new messages. There is no automatic-text fallback if the model forgets to send. Omitting `message_delivery` retains automatic assistant-text forwarding for compatibility.
+
 Tools can read the bot’s configured channels under current Matrix membership. They do not use administrator APIs. History older than the bot’s membership or without available encryption keys may be unavailable; results report undecryptable events rather than implying a complete search. Search is a case-insensitive substring scan, not a full-text index. Downloaded attachments remain in the private state directory’s `downloads` folder.
 
 ## Documentation and development

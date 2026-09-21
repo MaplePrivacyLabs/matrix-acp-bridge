@@ -84,6 +84,8 @@ enum Commands {
     Tools {
         #[arg(long)]
         socket: PathBuf,
+        #[arg(long, hide = true)]
+        send_scope: Option<String>,
     },
     /// Run the encrypted Matrix and ACP bridge in the foreground.
     #[cfg(feature = "matrix")]
@@ -152,6 +154,7 @@ async fn main() -> Result<()> {
                             "room_id":r.room_id,"binding":config.binding_fingerprint(&r.room_id),
                             "operators":r.operators,"operator_trust":r.operator_trust,
                             "audience_policy":r.audience_policy,"tool_approval":r.tool_approval,
+                            "message_delivery":r.message_delivery,
                         })).collect::<Vec<_>>()
                     })
                 );
@@ -190,8 +193,8 @@ async fn main() -> Result<()> {
             matrix_acp_bridge::live::verify(config, &user_id).await?;
         }
         #[cfg(feature = "matrix")]
-        Commands::Tools { socket } => {
-            matrix_acp_bridge::matrix_tools::proxy(&socket).await?;
+        Commands::Tools { socket, send_scope } => {
+            matrix_acp_bridge::matrix_tools::proxy(&socket, send_scope.as_deref()).await?;
         }
         #[cfg(feature = "matrix")]
         Commands::Run {

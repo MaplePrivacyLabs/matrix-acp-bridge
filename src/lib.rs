@@ -11,6 +11,7 @@ pub mod live;
 pub mod matrix;
 #[cfg(feature = "matrix")]
 pub mod matrix_tools;
+pub mod messaging;
 pub mod model;
 pub mod offline;
 pub mod runner;

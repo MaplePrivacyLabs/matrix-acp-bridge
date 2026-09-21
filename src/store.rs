@@ -93,6 +93,8 @@ impl Store {
             CREATE TABLE IF NOT EXISTS approval_decisions(request TEXT PRIMARY KEY REFERENCES approvals(id), option TEXT NOT NULL, source TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS run_inputs(run TEXT PRIMARY KEY REFERENCES runs(id), event TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox_reactions(txn TEXT PRIMARY KEY REFERENCES outbox(txn), event TEXT NOT NULL, key TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS explicit_outbox(txn TEXT PRIMARY KEY REFERENCES outbox(txn), run TEXT NOT NULL REFERENCES runs(id));
+            CREATE TABLE IF NOT EXISTS outbox_failures(txn TEXT PRIMARY KEY REFERENCES outbox(txn), reason TEXT NOT NULL);
         ")?;
         let version: Option<String> = db
             .query_row("SELECT value FROM meta WHERE key='schema'", [], |row| {
@@ -145,7 +147,7 @@ impl Store {
     }
 
     pub fn pending(&self) -> Result<Vec<Outbound>> {
-        let mut stmt = self.db.prepare("SELECT o.txn,c.key,c.room,c.root,o.body,x.event,x.key FROM outbox o JOIN conversations c ON c.key=o.conversation LEFT JOIN outbox_reactions x ON x.txn=o.txn WHERE o.delivered_event IS NULL ORDER BY o.rowid")?;
+        let mut stmt = self.db.prepare("SELECT o.txn,c.key,c.room,c.root,o.body,x.event,x.key FROM outbox o JOIN conversations c ON c.key=o.conversation LEFT JOIN outbox_reactions x ON x.txn=o.txn WHERE o.delivered_event IS NULL AND NOT EXISTS(SELECT 1 FROM outbox_failures f WHERE f.txn=o.txn) ORDER BY o.rowid")?;
         Ok(stmt
             .query_map([], |r| {
                 Ok(Outbound {
@@ -323,16 +325,23 @@ pub(crate) fn flush_output(db: &Connection, run: &str, conversation: &str, now: 
 }
 
 pub(crate) fn enqueue(db: &Connection, key: &str, body: &str, now: i64) -> Result<()> {
+    enqueue_ids(db, key, body, now).map(|_| ())
+}
+
+pub(crate) fn enqueue_ids(db: &Connection, key: &str, body: &str, now: i64) -> Result<Vec<String>> {
     // Split by Unicode scalar boundaries. This limits Matrix event size, not agent output.
     let chars: Vec<char> = body.chars().collect();
+    let mut ids = vec![];
     for chunk in chars.chunks(6000) {
         let text: String = chunk.iter().collect();
+        let txn = uuid::Uuid::new_v4().to_string();
         db.execute(
             "INSERT INTO outbox(txn,conversation,body,created) VALUES(?1,?2,?3,?4)",
-            params![uuid::Uuid::new_v4().to_string(), key, text, now],
+            params![txn, key, text, now],
         )?;
+        ids.push(txn);
     }
-    Ok(())
+    Ok(ids)
 }
 
 pub(crate) fn enqueue_reaction(

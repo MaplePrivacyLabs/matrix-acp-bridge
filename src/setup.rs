@@ -192,6 +192,7 @@ fn gather(
             audience_policy: crate::config::AudiencePolicy::RoomMembership,
             conversation: ConversationMode::Thread,
             tool_approval: Default::default(),
+            message_delivery: Default::default(),
         }],
         approval_ttl_seconds: 300,
         max_concurrent_runs: 1,

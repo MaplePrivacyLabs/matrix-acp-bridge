@@ -85,6 +85,28 @@ pub struct RoomPolicy {
     /// Automatic decisions only select an ACP allow option offered by the agent.
     #[serde(default, skip_serializing_if = "ToolApproval::is_manual")]
     pub tool_approval: ToolApproval,
+    /// Explicit mode publishes only calls to send_message_to_thread.
+    #[serde(default, skip_serializing_if = "MessageDelivery::is_automatic")]
+    pub message_delivery: MessageDelivery,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDelivery {
+    #[default]
+    Automatic,
+    Explicit,
+}
+impl MessageDelivery {
+    fn is_automatic(&self) -> bool {
+        *self == Self::Automatic
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Explicit => "explicit",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
