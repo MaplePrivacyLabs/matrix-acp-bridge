@@ -137,3 +137,38 @@ fn stop_after_worker_completion_cancels_racing_continuation() {
         .unwrap();
     assert!(bridge.resume_pending_steers(104).unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn newer_followup_does_not_overtake_a_pending_completion_race() {
+    let (mut runner, _) = fixture(Behavior::SteerThenReply);
+    let first = start(&mut runner.bridge, "one");
+    runner
+        .bridge
+        .handle(
+            &message("older", "older update", Some("$one")),
+            &room(),
+            101,
+        )
+        .unwrap();
+    runner
+        .bridge
+        .agent_event(
+            AgentEvent::Finished {
+                run_id: first,
+                status: RunStatus::Completed,
+            },
+            102,
+        )
+        .unwrap();
+    let newer = runner
+        .ingest(
+            &message("newer", "newer update", Some("$one")),
+            &room(),
+            103,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(newer.effects.as_slice(), [Effect::Steer { .. }]));
+    assert_eq!(runner.bridge.store.count_runs().unwrap(), 2);
+    runner.shutdown(104).await.unwrap();
+}

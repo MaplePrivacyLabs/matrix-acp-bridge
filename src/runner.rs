@@ -79,6 +79,12 @@ impl Runner {
     ) -> Result<Handled> {
         while self.try_update()?.is_some() {}
         self.reconcile_room(&event.room_id, room, now).await?;
+        // Deliver an older completion-race instruction before accepting a newer
+        // message in that conversation. Commands (especially stop) go first.
+        if !event.body.trim().starts_with("!bridge ") {
+            let pending = self.bridge.resume_pending_steers(now)?;
+            self.apply(&pending, now).await?;
+        }
         let handled = self.bridge.handle_with_context(event, room, context, now)?;
         self.apply(&handled.effects, now).await?;
         Ok(handled)
