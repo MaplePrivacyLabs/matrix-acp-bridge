@@ -29,6 +29,11 @@ use crate::{
     store::Store,
 };
 
+/// Room membership and the configured audience govern who can read replies.
+/// Verification is still required separately when admitting agent commands.
+/// The SDK continues to exclude devices explicitly marked as blocked.
+pub const REPLY_KEY_RECIPIENT_STRATEGY: CollectStrategy = CollectStrategy::AllDevices;
+
 pub struct MatrixAdapter {
     client: Client,
     allowed_rooms: BTreeSet<String>,
@@ -337,7 +342,7 @@ pub async fn build_client(config: &Config, store_passphrase: &str) -> Result<Cli
         .homeserver_url(&config.homeserver)
         .sqlite_store(config.state_dir.join("matrix"), Some(store_passphrase))
         .handle_refresh_tokens()
-        .with_room_key_recipient_strategy(CollectStrategy::OnlyTrustedDevices)
+        .with_room_key_recipient_strategy(REPLY_KEY_RECIPIENT_STRATEGY)
         .build()
         .await?)
 }

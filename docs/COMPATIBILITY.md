@@ -6,7 +6,7 @@ The bridge is an ordinary client of the Matrix Client-Server API, built with Mat
 
 Enrollment currently uses Matrix password login and cross-signing bootstrap. A server with only browser-based OIDC/SSO login needs additional enrollment support. There is no generic account-creation API: create the bot using your provider's usual signup/invite process. Use a dedicated account rather than repurposing an existing personal account with other sessions/keys.
 
-Work rooms must be encrypted. Senders must be allowlisted operators, current members, and verified through their cross-signing identity/device. Outbound room keys are shared only with trusted devices. Readers may therefore also need verification for their client to decrypt the bot's replies. Plaintext rooms are deliberately unsupported in this version.
+Work rooms must be encrypted. Senders must be allowlisted operators, current members, and verified through their cross-signing identity/device. Outbound room keys are shared with room members' unblocked devices, including unverified devices. Readers do not need a separate verification ceremony with the bot; the stricter verified-sender check applies to commands and approvals. Plaintext rooms are deliberately unsupported in this version.
 
 Stock Element desktop was used for live verification, mentions and thread replies. Other Matrix clients need compatible encrypted threads, mentions and verification UI; this project's current tests do not establish every client's behavior. Room membership, reactions and other metadata are not hidden by message encryption.
 

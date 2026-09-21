@@ -45,7 +45,7 @@ Only explicitly configured environment variables reach the adapter. Include the 
 ./target/release/matrix-acp-bridge verify '@you:example.org'
 ```
 
-`enroll` asks for the bot password locally, creates its persistent encrypted device store and joins only the configured invitations. Keep Element open on a **verified** human device. `verify` lists your devices; choose that active device, accept the request in Element, compare the emojis on both screens, and type `MATCH` in the worker terminal **only if they match**. Repeat for each operator **and each additional person who should read the bot's replies**: outbound keys are shared only with trusted devices. Both the device and cross-signing identity must be verified; a local device trust flag alone is insufficient.
+`enroll` asks for the bot password locally, creates its persistent encrypted device store and joins only the configured invitations. Keep Element open on a **verified** human device. `verify` lists your devices; choose that active device, accept the request in Element, compare the emojis on both screens, and type `MATCH` in the worker terminal **only if they match**. Repeat for each operator who will direct the agent. Both the sending device and cross-signing identity must be verified; a local device trust flag alone is insufficient. **Reading replies does not require verification with the bot:** reply keys are shared with room members' unblocked devices, including unverified devices.
 
 This is the trust handshake, not an administrator login. Keep the bot's state directory: recreating it creates a different device and loses the stored sessions/keys. See [troubleshooting](docs/TROUBLESHOOTING.md) if verification or delivery fails.
 
