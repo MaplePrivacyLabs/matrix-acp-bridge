@@ -259,6 +259,17 @@ impl Store {
     /// Restart must never replay ambiguous agent side effects automatically.
     pub fn recover(&mut self, now: i64) -> Result<usize> {
         let tx = self.db.transaction()?;
+        // Recovery is an explicit terminal boundary, never a periodic flush.
+        let buffered: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT o.run,r.conversation FROM output o JOIN runs r ON r.id=o.run",
+            )?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        for (run, conversation) in buffered {
+            flush_output(&tx, &run, &conversation, now)?;
+        }
         let active: Vec<(String, String)> = {
             let mut stmt = tx.prepare("SELECT id,conversation FROM runs WHERE status IN ('queued','running','waiting_approval','cancelling')")?;
             stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -295,6 +306,20 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+pub(crate) fn flush_output(db: &Connection, run: &str, conversation: &str, now: i64) -> Result<()> {
+    let text: String = {
+        let mut stmt = db.prepare("SELECT body FROM output WHERE run=?1 ORDER BY seq")?;
+        stmt.query_map([run], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .concat()
+    };
+    if !text.trim().is_empty() {
+        enqueue(db, conversation, &text, now)?;
+    }
+    db.execute("DELETE FROM output WHERE run=?1", [run])?;
+    Ok(())
 }
 
 pub(crate) fn enqueue(db: &Connection, key: &str, body: &str, now: i64) -> Result<()> {

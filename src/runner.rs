@@ -212,7 +212,6 @@ impl Runner {
         self.apply(&effects, now).await?;
         let effects = self.bridge.automatic_approvals(now)?;
         self.apply(&effects, now).await?;
-        self.bridge.flush_progress(now)?;
         Ok(())
     }
 

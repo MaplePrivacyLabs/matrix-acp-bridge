@@ -658,24 +658,6 @@ impl Bridge {
         Ok(effects)
     }
 
-    pub fn flush_progress(&mut self, now: i64) -> Result<()> {
-        let ids: Vec<String> = {
-            // Only recover leftovers from terminal runs. Active text is emitted
-            // at tool/permission/continuation boundaries or turn completion.
-            let mut stmt = self.store.db.prepare("SELECT DISTINCT o.run FROM output o JOIN runs r ON r.id=o.run WHERE r.status NOT IN ('queued','running','waiting_approval','cancelling')")?;
-            stmt.query_map([], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?
-        };
-        for id in ids {
-            if let Some(run) = self.store.run(&id)? {
-                let tx = self.store.db.transaction()?;
-                flush_run(&tx, &run, now)?;
-                tx.commit()?;
-            }
-        }
-        Ok(())
-    }
-
     pub fn expire_approvals(&mut self, now: i64) -> Result<Vec<Effect>> {
         let tx = self.store.db.transaction()?;
         let expired: Vec<(String, String, String)> = {
@@ -771,17 +753,7 @@ impl Bridge {
 }
 
 fn flush_run(db: &rusqlite::Connection, run: &Run, now: i64) -> Result<()> {
-    let text: String = {
-        let mut stmt = db.prepare("SELECT body FROM output WHERE run=?1 ORDER BY seq")?;
-        stmt.query_map([&run.id], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .concat()
-    };
-    if !text.trim().is_empty() {
-        enqueue(db, &run.conversation.key, &text, now)?;
-    }
-    db.execute("DELETE FROM output WHERE run=?1", [&run.id])?;
-    Ok(())
+    crate::store::flush_output(db, &run.id, &run.conversation.key, now)
 }
 
 fn allow_option(options: &[PermissionOption]) -> Option<String> {
