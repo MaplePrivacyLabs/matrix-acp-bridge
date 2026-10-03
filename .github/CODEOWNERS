@@ -1,0 +1,5 @@
+# Keep changes to CI configuration and its ownership under CTO review.
+# Ordinary source and documentation changes use the repository's normal review rules.
+/.github/CODEOWNERS @AnthonyRonning
+/.github/workflows/** @AnthonyRonning
+/.github/actions/** @AnthonyRonning
