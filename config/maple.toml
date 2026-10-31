@@ -8,6 +8,7 @@ program = "/home/agent/.local/bin/maple-agent"
 args = ["acp"]
 workspace = "/home/agent/projects"
 steering = "session_steering"
+mcp_transport = "http" # Maple accepts ACP HTTP servers; transient stdio is refused.
 # No `mode`: Maple does not advertise ACP permission modes.
 # Use an exact model ID advertised by your Maple account.
 [harness.config_options]

@@ -133,7 +133,9 @@ impl Runner {
                         .is_some_and(|p| {
                             p.message_delivery == crate::config::MessageDelivery::Explicit
                         });
-                    if explicit && let Some((hub, _)) = &self.messaging {
+                    if (explicit || harness.mcp_transport == crate::config::McpTransport::Http)
+                        && let Some((hub, _)) = &self.messaging
+                    {
                         self.scopes.insert(run_id.clone(), hub.bind(run_id));
                     }
                     let scope = self.scopes.get(run_id).map(|s| s.token.as_str());

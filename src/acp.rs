@@ -86,7 +86,7 @@ pub async fn inspect(
             if init.protocol_version != ProtocolVersion::V1 {
                 return Err(error("agent selected an unsupported protocol"));
             }
-            validate_steering(&init, harness.steering)?;
+            validate_harness(&init, &harness)?;
             let session = tokio::time::timeout(
                 Duration::from_secs(30),
                 connection
@@ -219,7 +219,7 @@ pub async fn execute(
         .connect_with(transport, |connection: ConnectionTo<Agent>| async move {
             let init = tokio::time::timeout(Duration::from_secs(30), connection.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task()).await.map_err(|_|error("ACP initialize timed out"))??;
             if init.protocol_version != ProtocolVersion::V1 { return Err(error("agent selected an unsupported protocol")); }
-            validate_steering(&init, harness.steering)?;
+            validate_harness(&init, &harness)?;
             let (session_id,modes) = if let Some(id) = run.session_id {
                 let modes=if init.agent_capabilities.load_session {
                     tokio::time::timeout(Duration::from_secs(30), connection.send_request(LoadSessionRequest::new(id.clone(),harness.workspace.clone()).mcp_servers(mcp_servers.clone())).block_task()).await.map_err(|_|error("ACP load timed out"))??.modes
@@ -364,11 +364,11 @@ pub async fn execute(
     result.map_err(Into::into)
 }
 
-fn validate_steering(
+fn validate_harness(
     init: &InitializeResponse,
-    steering: Steering,
+    harness: &HarnessConfig,
 ) -> agent_client_protocol::Result<()> {
-    if steering == Steering::SessionSteering
+    if harness.steering == Steering::SessionSteering
         && init
             .meta
             .as_ref()
@@ -378,6 +378,11 @@ fn validate_steering(
             != Some(true)
     {
         return Err(error("agent did not advertise _session/steering support"));
+    }
+    if harness.mcp_transport == crate::config::McpTransport::Http
+        && !init.agent_capabilities.mcp_capabilities.http
+    {
+        return Err(error("agent did not advertise HTTP MCP support"));
     }
     Ok(())
 }

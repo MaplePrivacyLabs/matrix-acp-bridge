@@ -528,6 +528,12 @@ pub async fn run(config: Config, retry_event: Option<&str>) -> Result<()> {
     let (hub, requests) = crate::messaging::SendHub::new();
     let tools_server =
         crate::matrix_tools::listen(config.clone(), adapter.clone(), hub.clone()).await?;
+    let http = if config.harness.mcp_transport == crate::config::McpTransport::Http {
+        Some(crate::matrix_tools::listen_http(config.clone(), adapter.clone(), hub.clone()).await?)
+    } else {
+        None
+    };
+    let http_url = http.as_ref().map(|(url, _)| url.clone());
     let socket = config.tools_socket_path();
     let bridge = Bridge::new(config, store)?;
     let mut runner = Runner::new(
@@ -537,7 +543,16 @@ pub async fn run(config: Config, retry_event: Option<&str>) -> Result<()> {
     .with_messaging(
         hub,
         requests,
-        Arc::new(move |_, scope| vec![crate::matrix_tools::agent_server(socket.clone(), scope)]),
+        Arc::new(move |_, scope| {
+            vec![if let Some(url) = &http_url {
+                crate::matrix_tools::http_agent_server(
+                    url,
+                    scope.expect("HTTP runs always have a scope"),
+                )
+            } else {
+                crate::matrix_tools::agent_server(socket.clone(), scope)
+            }]
+        }),
     );
     if let Some(event_id) = retry_event {
         let event = configured_event(adapter.client(), &runner.bridge.config, event_id).await?;
@@ -577,6 +592,9 @@ pub async fn run(config: Config, retry_event: Option<&str>) -> Result<()> {
     }
     runner.shutdown(now()).await?;
     tools_server.abort();
+    if let Some((_, server)) = http {
+        server.abort();
+    }
     if failures >= 5 {
         anyhow::bail!(
             "Matrix driver stopped after repeated failures; staged events remain for recovery"
