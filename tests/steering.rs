@@ -356,3 +356,73 @@ fn native_input_ack_does_not_split_an_assistant_sentence() {
     assert!(messages.iter().any(|m| m.body == "Thanks, teammate!"));
     assert!(!messages.iter().any(|m| m.body == "Thanks, "));
 }
+
+#[tokio::test]
+async fn advertised_session_steering_injects_without_cancelling_or_second_prompt() {
+    native_session_steering(Behavior::SessionSteer, 1).await;
+}
+
+#[tokio::test]
+async fn idle_session_steering_race_appends_once_after_original_turn() {
+    native_session_steering(Behavior::SessionSteerRace, 2).await;
+}
+
+async fn native_session_steering(behavior: Behavior, expected_prompts: usize) {
+    let (mut runner, agent) = fixture(behavior);
+    runner.bridge.config.harness.steering = matrix_acp_bridge::config::Steering::SessionSteering;
+    runner
+        .ingest(&message("one", "original work", None), &room(), 100)
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if !agent.observations.lock().unwrap().prompts.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    runner
+        .ingest(
+            &message("steer", "added context", Some("$one")),
+            &room(),
+            101,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if !agent.observations.lock().unwrap().interjections.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!agent.observations.lock().unwrap().tool_finished);
+    agent.release_tool.notify_one();
+    assert_eq!(finish(&mut runner).await, RunStatus::Completed);
+    let obs = agent.observations.lock().unwrap();
+    assert_eq!(obs.cancellations, 0);
+    assert_eq!(obs.new_sessions, 1);
+    assert_eq!(obs.prompts.len(), expected_prompts);
+    assert_eq!(obs.interjections, vec!["added context"]);
+    if expected_prompts == 2 {
+        assert_eq!(obs.prompts[1], "added context");
+    }
+}
+
+#[tokio::test]
+async fn unadvertised_native_steering_prevents_prompt() {
+    let (mut runner, agent) = fixture(Behavior::Reply);
+    runner.bridge.config.harness.steering = matrix_acp_bridge::config::Steering::SessionSteering;
+    runner
+        .ingest(&message("one", "must not run", None), &room(), 100)
+        .await
+        .unwrap();
+    assert_eq!(finish(&mut runner).await, RunStatus::Failed);
+    assert!(agent.observations.lock().unwrap().prompts.is_empty());
+}

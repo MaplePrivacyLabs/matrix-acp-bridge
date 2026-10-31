@@ -18,6 +18,9 @@ pub enum Behavior {
     CodexSteer,
     GrokInterject,
     GrokLate,
+    SessionSteer,
+    SessionSteerRace,
+    RejectConfig,
     NoModes,
     RejectMode,
     WrongSession,
@@ -35,6 +38,7 @@ pub struct Observations {
     pub interjections: Vec<String>,
     pub tool_finished: bool,
     pub roster_checks: usize,
+    pub configuration: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -64,6 +68,7 @@ impl FixtureAgent {
         let release_tool = self.release_tool.clone();
         let obs_cancel = self.observations.clone();
         let obs_ext = self.observations.clone();
+        let obs_config = self.observations.clone();
         let finish_native = self.finish_native.clone();
         let cancelled = Arc::new(Notify::new());
         let cancel_prompt = cancelled.clone();
@@ -74,7 +79,11 @@ impl FixtureAgent {
                     && capabilities.pointer("/fs/writeTextFile").and_then(|v|v.as_bool()) != Some(true)
                     && capabilities.get("terminal").and_then(|v|v.as_bool()) != Some(true);
                 obs_init.lock().expect("fixture lock").client_tools_disabled = disabled;
-                responder.respond(InitializeResponse::new(request.protocol_version).agent_capabilities(AgentCapabilities::new().load_session(true)))
+                let mut response = InitializeResponse::new(request.protocol_version).agent_capabilities(AgentCapabilities::new().load_session(true));
+                if matches!(behavior,Behavior::SessionSteer | Behavior::SessionSteerRace) {
+                    response.meta = Some(serde_json::from_value(json!({"steering":{"supported":true}})).unwrap());
+                }
+                responder.respond(response)
             },agent_client_protocol::on_receive_request!())
             .on_receive_request(async move |_request: NewSessionRequest,responder,_cx| {
                 let mut obs = obs_new.lock().expect("fixture lock");
@@ -92,6 +101,14 @@ impl FixtureAgent {
             .on_receive_request(async move |_request: SetSessionModeRequest,responder,_cx| {
                 if matches!(behavior,Behavior::RejectMode) { responder.respond_with_error(agent_client_protocol::Error::internal_error()) }
                 else { responder.respond(SetSessionModeResponse::default()) }
+            },agent_client_protocol::on_receive_request!())
+            .on_receive_request(async move |request: SetSessionConfigOptionRequest,responder,_cx| {
+                let value = request.value.as_value_id().unwrap().to_string();
+                obs_config.lock().unwrap().configuration.push((request.config_id.to_string(),value.clone()));
+                let current = if matches!(behavior,Behavior::RejectConfig) {"wrong".to_owned()} else {value};
+                responder.respond(serde_json::from_value::<SetSessionConfigOptionResponse>(json!({"configOptions":[{
+                    "id":request.config_id,"name":"Fixture option","type":"select","currentValue":current,"options":[]
+                }]})).unwrap())
             },agent_client_protocol::on_receive_request!())
             .on_receive_notification(async move |_notification: CancelNotification,_cx| {
                 obs_cancel.lock().unwrap().cancellations += 1;
@@ -112,7 +129,7 @@ impl FixtureAgent {
                     cancel_prompt.notified().await;
                     return responder.respond(PromptResponse::new(StopReason::Cancelled));
                 }
-                if matches!(behavior,Behavior::SteerThenReply | Behavior::CodexSteer | Behavior::GrokInterject | Behavior::GrokLate) && obs_prompt.lock().unwrap().prompts.len()==1 {
+                if matches!(behavior,Behavior::SteerThenReply | Behavior::CodexSteer | Behavior::GrokInterject | Behavior::GrokLate | Behavior::SessionSteer | Behavior::SessionSteerRace) && obs_prompt.lock().unwrap().prompts.len()==1 {
                     // A deterministic running tool: only the test can release it.
                     cx.send_notification(SessionNotification::new(session.clone(),SessionUpdate::ToolCall(ToolCall::new("held-tool","Fixture running tool"))))?;
                     tokio::select! {
@@ -151,6 +168,12 @@ impl FixtureAgent {
                 })
             },agent_client_protocol::on_receive_request!())
             .on_receive_request(async move |request: UntypedMessage,responder,cx| {
+                if request.method == "_session/steering" && matches!(behavior,Behavior::SessionSteer | Behavior::SessionSteerRace) {
+                    assert_eq!(request.params.pointer("/_meta/steering/idleBehavior"),Some(&json!("promptRequired")));
+                    obs_ext.lock().unwrap().interjections.push(request.params["prompt"][0]["text"].as_str().unwrap().to_owned());
+                    let value = if matches!(behavior,Behavior::SessionSteerRace) {json!({"outcome":"promptRequired","reason":"noRunningTurn"})} else {json!({"outcome":"injected"})};
+                    return responder.respond(value);
+                }
                 if !matches!(behavior,Behavior::GrokInterject | Behavior::GrokLate) { return responder.respond_with_error(agent_client_protocol::Error::method_not_found()); }
                 let value=match request.method.as_str() {
                     "_x.ai/interject" => {

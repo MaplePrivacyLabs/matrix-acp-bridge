@@ -86,6 +86,7 @@ pub async fn inspect(
             if init.protocol_version != ProtocolVersion::V1 {
                 return Err(error("agent selected an unsupported protocol"));
             }
+            validate_steering(&init, harness.steering)?;
             let session = tokio::time::timeout(
                 Duration::from_secs(30),
                 connection
@@ -94,6 +95,7 @@ pub async fn inspect(
             )
             .await
             .map_err(|_| error("ACP session creation timed out; check adapter authentication"))??;
+            apply_config_options(&connection, &session.session_id, &harness.config_options).await?;
             let modes: Vec<_> = session
                 .modes
                 .map(|m| {
@@ -217,6 +219,7 @@ pub async fn execute(
         .connect_with(transport, |connection: ConnectionTo<Agent>| async move {
             let init = tokio::time::timeout(Duration::from_secs(30), connection.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task()).await.map_err(|_|error("ACP initialize timed out"))??;
             if init.protocol_version != ProtocolVersion::V1 { return Err(error("agent selected an unsupported protocol")); }
+            validate_steering(&init, harness.steering)?;
             let (session_id,modes) = if let Some(id) = run.session_id {
                 let modes=if init.agent_capabilities.load_session {
                     tokio::time::timeout(Duration::from_secs(30), connection.send_request(LoadSessionRequest::new(id.clone(),harness.workspace.clone()).mcp_servers(mcp_servers.clone())).block_task()).await.map_err(|_|error("ACP load timed out"))??.modes
@@ -228,6 +231,7 @@ pub async fn execute(
                 let created = tokio::time::timeout(Duration::from_secs(30), connection.send_request(NewSessionRequest::new(harness.workspace.clone()).mcp_servers(mcp_servers.clone())).block_task()).await.map_err(|_|error("ACP session creation timed out"))??;
                 (created.session_id,created.modes)
             };
+            apply_config_options(&connection, &session_id, &harness.config_options).await?;
             if let Some(mode) = harness.mode {
                 let modes = modes.ok_or_else(||error("agent must advertise the required permission mode"))?;
                 if !modes.available_modes.iter().any(|m|m.id.to_string() == mode) { return Err(error("required permission mode is unavailable")); }
@@ -246,6 +250,7 @@ pub async fn execute(
                 let mut steering: Vec<(String,String)> = vec![];
                 let mut concurrent_inputs = Vec::new();
                 let mut interjections = FuturesUnordered::new();
+                let mut session_steers = FuturesUnordered::new();
                 let mut primary_outcome = None;
                 let mut needs_native_drain = false;
                 let mut drain = None;
@@ -253,7 +258,7 @@ pub async fn execute(
                 tokio::pin!(stop_deadline);
                 let outcome = loop {
                     if let Some(outcome) = primary_outcome
-                        && interjections.is_empty() {
+                        && interjections.is_empty() && session_steers.is_empty() {
                             if needs_native_drain {
                                 if drain.is_none() {
                                     drain = Some(Box::pin(drain_grok(connection.clone(), session_id.clone())));
@@ -266,6 +271,16 @@ pub async fn execute(
                             primary_outcome = Some(prompt_status(response?));
                             for event_id in std::mem::take(&mut concurrent_inputs) {
                                 updates.send(AgentEvent::Steered {run_id:run.id.clone(),event_id}).await.map_err(|_|error("controller closed"))?;
+                            }
+                        }
+                        Some(result) = session_steers.next(), if !session_steers.is_empty() => {
+                            let (event_id, text, injected) = result?;
+                            if injected {
+                                updates.send(AgentEvent::Steered {run_id:run.id.clone(),event_id}).await.map_err(|_|error("controller closed"))?;
+                            } else {
+                                // The provider consumed nothing. Append exactly once through
+                                // the normal prompt path after the original turn resolves.
+                                steering.push((event_id,text));
                             }
                         }
                         Some(result) = interjections.next(), if !interjections.is_empty() => {
@@ -303,6 +318,7 @@ pub async fn execute(
                                         generation += 1;
                                         submit_prompt(&connection,session_id.clone(),text,generation,responses.clone())?;
                                     },
+                                    Steering::SessionSteering => session_steers.push(steer_session(connection.clone(),session_id.clone(),event_id,text)),
                                     Steering::GrokInterject => interjections.push(interject_grok(connection.clone(),session_id.clone(),event_id,text)),
                                 }
                             }
@@ -348,6 +364,77 @@ pub async fn execute(
     result.map_err(Into::into)
 }
 
+fn validate_steering(
+    init: &InitializeResponse,
+    steering: Steering,
+) -> agent_client_protocol::Result<()> {
+    if steering == Steering::SessionSteering
+        && init
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("steering"))
+            .and_then(|s| s.get("supported"))
+            .and_then(|v| v.as_bool())
+            != Some(true)
+    {
+        return Err(error("agent did not advertise _session/steering support"));
+    }
+    Ok(())
+}
+
+async fn apply_config_options(
+    connection: &ConnectionTo<Agent>,
+    session: &SessionId,
+    options: &BTreeMap<String, String>,
+) -> agent_client_protocol::Result<()> {
+    for (id, value) in options {
+        let response = tokio::time::timeout(
+            Duration::from_secs(30),
+            connection
+                .send_request(SetSessionConfigOptionRequest::new(
+                    session.clone(),
+                    id.clone(),
+                    SessionConfigOptionValue::value_id(value.clone()),
+                ))
+                .block_task(),
+        )
+        .await
+        .map_err(|_| error("ACP configuration timed out"))??;
+        if !response.config_options.iter().any(|o| o.id.to_string() == *id
+            && matches!(&o.kind, SessionConfigKind::Select(select) if select.current_value.to_string() == *value)) {
+            return Err(error("agent did not acknowledge requested ACP configuration"));
+        }
+    }
+    Ok(())
+}
+
+async fn steer_session(
+    connection: ConnectionTo<Agent>,
+    session: SessionId,
+    event_id: String,
+    text: String,
+) -> agent_client_protocol::Result<(String, String, bool)> {
+    let response = raw_extension_request(
+        &connection,
+        "_session/steering",
+        serde_json::json!({
+            "sessionId":session, "prompt":[{"type":"text","text":text}],
+            "_meta":{"steering":{"idleBehavior":"promptRequired"}}
+        }),
+    )
+    .await?;
+    let injected = match response.get("outcome").and_then(|v| v.as_str()) {
+        Some("injected") => true,
+        Some("promptRequired")
+            if response.get("reason").and_then(|v| v.as_str()) == Some("noRunningTurn") =>
+        {
+            false
+        }
+        _ => return Err(error("agent returned an unsupported steering outcome")),
+    };
+    Ok((event_id, text, injected))
+}
+
 fn prompt_status(response: PromptResponse) -> RunStatus {
     match response.stop_reason {
         StopReason::EndTurn => RunStatus::Completed,
@@ -377,27 +464,37 @@ fn submit_prompt(
         })
 }
 
-async fn grok_request(
+async fn raw_extension_request(
     connection: &ConnectionTo<Agent>,
     method: &str,
     params: serde_json::Value,
 ) -> agent_client_protocol::Result<serde_json::Value> {
-    let response = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(30),
         connection
             .send_request(UntypedMessage::new(method, params)?)
             .block_task(),
     )
     .await
-    .map_err(|_| error("Grok extension request timed out"))??;
+    .map_err(|_| error("ACP extension request timed out"))?
+}
+
+async fn extension_request(
+    connection: &ConnectionTo<Agent>,
+    method: &str,
+    params: serde_json::Value,
+) -> agent_client_protocol::Result<serde_json::Value> {
+    // Grok wraps extension payloads in its own result/error object. The
+    // advertised session-steering extension uses a normal JSON-RPC result.
+    let response = raw_extension_request(connection, method, params).await?;
     if response.get("error").is_some_and(|e| !e.is_null()) {
-        return Err(error("Grok extension rejected request"));
+        return Err(error("ACP extension rejected request"));
     }
     response
         .get("result")
         .cloned()
         .filter(|r| !r.is_null())
-        .ok_or_else(|| error("Grok extension returned no result"))
+        .ok_or_else(|| error("ACP extension returned no result"))
 }
 
 async fn interject_grok(
@@ -406,7 +503,7 @@ async fn interject_grok(
     event_id: String,
     text: String,
 ) -> agent_client_protocol::Result<String> {
-    let response = grok_request(
+    let response = extension_request(
         &connection,
         "_x.ai/interject",
         serde_json::json!({"sessionId":session,"text":text,"interjectionId":event_id}),
@@ -427,14 +524,14 @@ async fn drain_grok(
     session: SessionId,
 ) -> agent_client_protocol::Result<()> {
     loop {
-        grok_request(
+        extension_request(
             &connection,
             "_x.ai/session/info",
             serde_json::json!({"sessionId":session}),
         )
         .await?;
         let response =
-            grok_request(&connection, "_x.ai/sessions/list", serde_json::json!({})).await?;
+            extension_request(&connection, "_x.ai/sessions/list", serde_json::json!({})).await?;
         let row = response
             .get("sessions")
             .and_then(|s| s.as_array())

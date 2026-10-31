@@ -1,0 +1,26 @@
+# Maple Work: install the official CLI and sign in on the worker first.
+bot_user_id = "@agent:example.invalid"
+homeserver = "https://matrix.example.invalid"
+state_dir = "/home/agent/.local/share/matrix-acp-bridge/state"
+
+[harness]
+program = "/home/agent/.local/bin/maple-agent"
+args = ["acp"]
+workspace = "/home/agent/projects"
+steering = "session_steering"
+# No `mode`: Maple does not advertise ACP permission modes.
+# Use an exact model ID advertised by your Maple account.
+[harness.config_options]
+model = "deepseek-v4-1-flash"
+[harness.env]
+HOME = "/home/agent"
+PATH = "/home/agent/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+[[rooms]]
+room_id = "!private-room:example.invalid"
+operators = ["@owner:example.invalid"]
+operator_trust = "account"
+audience_policy = "room_membership"
+conversation = "thread"
+tool_approval = "automatic"
+message_delivery = "explicit"

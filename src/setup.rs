@@ -133,6 +133,7 @@ fn gather(
             env: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
             mode: (!mode.is_empty()).then_some(mode),
             steering: Default::default(),
+            config_options: BTreeMap::new(),
         }
     } else {
         let program = path(ask(input, output, "ACP executable (absolute path)", "")?)?;
@@ -173,6 +174,7 @@ fn gather(
             workspace,
             mode: (!mode.is_empty()).then_some(mode),
             steering: Default::default(),
+            config_options: BTreeMap::new(),
             env: BTreeMap::from([
                 ("HOME".into(), home.to_string_lossy().into_owned()),
                 ("PATH".into(), search_path),
