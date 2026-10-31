@@ -50,6 +50,22 @@ pub struct HarnessConfig {
     /// ACP select options applied and acknowledged before any prompt (e.g. model).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub config_options: BTreeMap<String, String>,
+    /// Loopback HTTP supports agents that refuse caller-supplied executables.
+    #[serde(default, skip_serializing_if = "McpTransport::is_stdio")]
+    pub mcp_transport: McpTransport,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransport {
+    #[default]
+    Stdio,
+    Http,
+}
+impl McpTransport {
+    fn is_stdio(&self) -> bool {
+        *self == Self::Stdio
+    }
 }
 
 /// Provider-specific delivery is explicit; ordinary ACP never receives concurrent prompts.

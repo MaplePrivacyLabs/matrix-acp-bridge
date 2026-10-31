@@ -41,6 +41,7 @@ pub struct MatrixTools {
     config: Config,
     adapter: MatrixAdapter,
     sender: Option<(SendHub, String)>,
+    http_hub: Option<SendHub>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -126,6 +127,7 @@ impl MatrixTools {
             config,
             adapter,
             sender: None,
+            http_hub: None,
         }
     }
     async fn room(&self, id: &str) -> Result<Room> {
@@ -317,12 +319,15 @@ impl MatrixTools {
     async fn send_message_to_thread(
         &self,
         Parameters(request): Parameters<SendMessage>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (hub, scope) = self
-            .sender
-            .as_ref()
-            .ok_or_else(|| error("explicit sending is not enabled for this session"))?;
-        let receipt = hub.send(scope, request.text).await.map_err(error)?;
+        let receipt = if let Some((hub, scope)) = self.sender.as_ref() {
+            hub.send(scope, request.text).await.map_err(error)?
+        } else if let Some(hub) = self.http_hub.as_ref() {
+            send_http(hub, &context, request.text).await?
+        } else {
+            return Err(error("explicit sending is not enabled for this session"));
+        };
         Ok(result(serde_json::to_value(receipt).map_err(error)?))
     }
     #[tool(
@@ -504,6 +509,96 @@ pub async fn listen(
     }))
 }
 
+/// HTTP is loopback-only and authenticates every request with a revocable run
+/// scope. Routing stays server-owned; a caller cannot supply a room/thread ID.
+pub async fn listen_http(
+    config: Config,
+    adapter: MatrixAdapter,
+    hub: SendHub,
+) -> Result<(String, tokio::task::JoinHandle<()>)> {
+    let mut tools = MatrixTools::new(config, adapter);
+    tools.http_hub = Some(hub.clone());
+    http_service(tools, hub).await
+}
+
+fn bearer_scope<'a>(headers: &'a axum::http::HeaderMap, hub: &SendHub) -> Option<&'a str> {
+    if headers.contains_key(axum::http::header::ORIGIN)
+        || headers
+            .get_all(axum::http::header::AUTHORIZATION)
+            .iter()
+            .count()
+            != 1
+    {
+        return None;
+    }
+    let scope = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")?;
+    hub.valid(scope).then_some(scope)
+}
+
+async fn send_http(
+    hub: &SendHub,
+    context: &rmcp::service::RequestContext<rmcp::RoleServer>,
+    text: String,
+) -> Result<crate::messaging::DeliveryReceipt, ErrorData> {
+    let parts = context
+        .extensions
+        .get::<axum::http::request::Parts>()
+        .ok_or_else(|| error("HTTP tool request has no authenticated scope"))?;
+    let scope = bearer_scope(&parts.headers, hub)
+        .ok_or_else(|| error("HTTP tool request has no active scope"))?;
+    hub.send(scope, text).await.map_err(error)
+}
+
+async fn http_service<S: ServerHandler + Clone>(
+    tools: S,
+    hub: SendHub,
+) -> Result<(String, tokio::task::JoinHandle<()>)> {
+    use axum::{response::IntoResponse, routing::any};
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    };
+    let service = StreamableHttpService::new(
+        move || Ok(tools.clone()),
+        std::sync::Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default()
+            .with_legacy_session_mode(false)
+            .with_json_response(true),
+    );
+    let router = axum::Router::new().route(
+        "/mcp",
+        any(move |request: axum::extract::Request| {
+            let service = service.clone();
+            let hub = hub.clone();
+            async move {
+                if bearer_scope(request.headers(), &hub).is_none() {
+                    return axum::http::StatusCode::UNAUTHORIZED.into_response();
+                }
+                service.handle(request).await.into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/mcp", listener.local_addr()?);
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    Ok((url, task))
+}
+
+pub fn http_agent_server(url: &str, scope: &str) -> agent_client_protocol::schema::v1::McpServer {
+    use agent_client_protocol::schema::v1::{HttpHeader, McpServer, McpServerHttp};
+    McpServer::Http(
+        McpServerHttp::new("matrix", url).headers(vec![HttpHeader::new(
+            "Authorization",
+            format!("Bearer {scope}"),
+        )]),
+    )
+}
+
 pub async fn proxy(path: &Path, scope: Option<&str>) -> Result<()> {
     let mut stream = UnixStream::connect(path).await?;
     stream
@@ -606,5 +701,157 @@ mod tests {
             serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded).unwrap()).unwrap();
         assert_eq!(decoded.skip, 23);
         assert_eq!(decoded.from.as_deref(), Some("opaque-pagination-token"));
+    }
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Clone)]
+    struct Fixture {
+        hub: SendHub,
+    }
+    #[tool_router]
+    impl Fixture {
+        #[tool(description = "Fixture scoped send")]
+        async fn send(
+            &self,
+            context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> Result<CallToolResult, ErrorData> {
+            send_http(&self.hub, &context, "fixture".into()).await?;
+            Ok(CallToolResult::success(vec![]))
+        }
+    }
+    #[tool_handler]
+    impl ServerHandler for Fixture {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        }
+    }
+
+    async fn post(url: &str, headers: &[(&str, &str)], body: Value) -> String {
+        let authority = url
+            .strip_prefix("http://")
+            .unwrap()
+            .strip_suffix("/mcp")
+            .unwrap();
+        assert!(authority.starts_with("127.0.0.1:"));
+        let mut stream = tokio::net::TcpStream::connect(authority).await.unwrap();
+        let body = body.to_string();
+        let host = headers
+            .iter()
+            .find(|(name, _)| *name == "Host")
+            .map(|(_, value)| *value)
+            .unwrap_or(authority);
+        let mut request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2025-03-26\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        for (name, value) in headers {
+            if *name == "Host" {
+                continue;
+            }
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str(&format!("\r\n{body}"));
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut data = vec![];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut data),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        String::from_utf8(data).unwrap()
+    }
+
+    #[tokio::test]
+    async fn http_requires_live_scope_and_routes_each_request_to_its_run() {
+        let (hub, mut requests) = SendHub::new();
+        let first = hub.bind("first");
+        let second = hub.bind("second");
+        let (url, task) = http_service(Fixture { hub: hub.clone() }, hub)
+            .await
+            .unwrap();
+        let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}});
+        assert!(
+            post(&url, &[], init.clone())
+                .await
+                .starts_with("HTTP/1.1 401")
+        );
+        let auth = format!("Bearer {}", first.token);
+        assert!(
+            post(
+                &url,
+                &[
+                    ("Authorization", &auth),
+                    ("Origin", "https://example.invalid")
+                ],
+                init.clone()
+            )
+            .await
+            .starts_with("HTTP/1.1 401")
+        );
+        assert!(
+            post(
+                &url,
+                &[("Authorization", &auth), ("Authorization", &auth)],
+                init.clone()
+            )
+            .await
+            .starts_with("HTTP/1.1 401")
+        );
+        let rebound = post(
+            &url,
+            &[
+                ("Authorization", &auth),
+                ("Host", "attacker.example.invalid"),
+            ],
+            init.clone(),
+        )
+        .await;
+        assert!(rebound.starts_with("HTTP/1.1 4"), "{rebound}");
+        let response = post(&url, &[("Authorization", &auth)], init.clone()).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("serverInfo"));
+        for (scope, run) in [(&first, "first"), (&second, "second")] {
+            let auth = format!("Bearer {}", scope.token);
+            let headers = [("Authorization", auth.as_str())];
+            let sending = post(
+                &url,
+                &headers,
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{}}}),
+            );
+            let receive = async {
+                let request = requests.recv().await.unwrap();
+                assert_eq!(request.run_id, run);
+                request
+                    .reply
+                    .send(Ok(crate::messaging::DeliveryReceipt {
+                        sent: true,
+                        room_id: "!fixture:example.invalid".into(),
+                        thread_root: None,
+                        event_ids: vec![],
+                    }))
+                    .unwrap();
+            };
+            let (response, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(sending, receive)
+            })
+            .await
+            .unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert!(!response.contains("isError\":true"), "{response}");
+        }
+        drop(first);
+        assert!(
+            post(&url, &[("Authorization", &auth)], init)
+                .await
+                .starts_with("HTTP/1.1 401")
+        );
+        task.abort();
     }
 }

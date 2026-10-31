@@ -130,3 +130,5 @@ Follow-ups do not interrupt tools. The portable default (`harness.steering = "af
 `harness.mode` is optional. If you set it, the bridge requires that exact advertised ACP mode. Agents without ACP modes retain their own permission settings; Matrix tool approvals still follow the room policy.
 
 Set `[harness.config_options]` entries such as `model = "your-model-id"` to select ACP options before prompting. Each value must be acknowledged by the agent on new and resumed sessions; an unsupported option stops the run before any prompt. Empty options preserve existing configuration bindings. These are deployment choices, not model defaults inferred by the bridge.
+
+For agents that support HTTP MCP but refuse transient stdio commands, set `harness.mcp_transport = "http"` (required for Maple Work). The bridge binds an ephemeral IPv4 loopback port and passes a per-run bearer header through ACP. Every HTTP request needs an active scope; browser-origin requests are refused. Finishing the run revokes its scope. The default remains stdio over the private Unix socket, and empty/default settings preserve existing binding hashes.

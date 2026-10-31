@@ -298,3 +298,15 @@ async fn unacknowledged_model_selection_prevents_prompt() {
     assert_eq!(finish(&mut runner).await, RunStatus::Failed);
     assert!(agent.observations.lock().unwrap().prompts.is_empty());
 }
+
+#[tokio::test]
+async fn unadvertised_http_mcp_prevents_prompt() {
+    let (mut runner, agent) = fixture(Behavior::Reply);
+    runner.bridge.config.harness.mcp_transport = matrix_acp_bridge::config::McpTransport::Http;
+    runner
+        .ingest(&message("one", "must not run", None), &room(), 100)
+        .await
+        .unwrap();
+    assert_eq!(finish(&mut runner).await, RunStatus::Failed);
+    assert!(agent.observations.lock().unwrap().prompts.is_empty());
+}
