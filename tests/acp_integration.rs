@@ -253,3 +253,48 @@ async fn modes_may_be_omitted_only_when_configuration_does_not_require_one() {
         .unwrap();
     assert!(report.mode_applied && report.modes.is_empty());
 }
+
+#[tokio::test]
+async fn model_selection_is_acknowledged_before_new_and_resumed_prompts() {
+    let (mut runner, agent) = fixture(Behavior::Reply);
+    runner
+        .bridge
+        .config
+        .harness
+        .config_options
+        .insert("model".into(), "fixture-model".into());
+    runner
+        .ingest(&message("one", "first", None), &room(), 100)
+        .await
+        .unwrap();
+    assert_eq!(finish(&mut runner).await, RunStatus::Completed);
+    runner
+        .ingest(&message("two", "next", Some("$one")), &room(), 102)
+        .await
+        .unwrap();
+    assert_eq!(finish(&mut runner).await, RunStatus::Completed);
+    let obs = agent.observations.lock().unwrap();
+    assert_eq!(
+        obs.configuration,
+        vec![("model".into(), "fixture-model".into()); 2]
+    );
+    assert_eq!(obs.new_sessions, 1);
+    assert_eq!(obs.loaded, vec!["fixture-1"]);
+}
+
+#[tokio::test]
+async fn unacknowledged_model_selection_prevents_prompt() {
+    let (mut runner, agent) = fixture(Behavior::RejectConfig);
+    runner
+        .bridge
+        .config
+        .harness
+        .config_options
+        .insert("model".into(), "fixture-model".into());
+    runner
+        .ingest(&message("one", "must not run", None), &room(), 100)
+        .await
+        .unwrap();
+    assert_eq!(finish(&mut runner).await, RunStatus::Failed);
+    assert!(agent.observations.lock().unwrap().prompts.is_empty());
+}

@@ -35,7 +35,7 @@ cargo build --locked --release --features matrix
 ./target/release/matrix-acp-bridge doctor
 ```
 
-`init` writes a private `config.toml` and never overwrites one. It asks for IDs, an ACP executable and arguments, workspace, mode, and the agent's HOME/PATH. No passwords are stored in that configuration. `doctor` starts the adapter, creates an empty session, checks its modes and ability to resume, then exits **without sending a prompt or connecting to Matrix**. If the mode is wrong, it lists available modes so you can correct the config.
+`init` writes a private `config.toml` and never overwrites one. It asks for IDs, an ACP executable and arguments, workspace, mode, and the agent's HOME/PATH. No passwords are stored in that configuration. `doctor` starts the adapter, creates an empty session, checks its modes and ability to resume, checks configured ACP select options and native steering support, then exits **without sending a prompt or connecting to Matrix**. If the mode is wrong, it lists available modes so you can correct the config.
 
 Only explicitly configured environment variables reach the adapter. Include the runtime directory in PATH when an adapter needs Node, Python, or another runtime. Do not point the worker at a privileged administrator's HOME. See [the example config](config/example.toml) for the complete format.
 
@@ -125,6 +125,8 @@ The demos use deterministic in-memory ACP fixtures. They do not contact Matrix o
 
 ### Follow-ups and providers
 
-Follow-ups do not interrupt tools. The portable default (`harness.steering = "after_turn"`) appends them after the current ACP prompt finishes. For Codex ACP, opt into `concurrent_prompt` to send follow-ups during the turn. For Grok Build use `grok_interject`; see the [Grok configuration](config/grok.toml) and [provider notes](docs/COMPATIBILITY.md#grok-build). `!bridge stop` remains an explicit cancellation.
+Follow-ups do not interrupt tools. The portable default (`harness.steering = "after_turn"`) appends them after the current ACP prompt finishes. For Codex ACP, opt into `concurrent_prompt` to send follow-ups during the turn. For Maple Work (or a compatible agent advertising `_meta.steering.supported`) use `session_steering`; see [the Maple example](config/maple.toml). This injects into the running turn and appends a normal prompt only when the agent explicitly reports that the turn has already ended. For Grok Build use `grok_interject`; see the [Grok configuration](config/grok.toml) and [provider notes](docs/COMPATIBILITY.md#grok-build). `!bridge stop` remains an explicit cancellation.
 
 `harness.mode` is optional. If you set it, the bridge requires that exact advertised ACP mode. Agents without ACP modes retain their own permission settings; Matrix tool approvals still follow the room policy.
+
+Set `[harness.config_options]` entries such as `model = "your-model-id"` to select ACP options before prompting. Each value must be acknowledged by the agent on new and resumed sessions; an unsupported option stops the run before any prompt. Empty options preserve existing configuration bindings. These are deployment choices, not model defaults inferred by the bridge.

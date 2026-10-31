@@ -47,6 +47,9 @@ pub struct HarnessConfig {
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Steering::is_after_turn")]
     pub steering: Steering,
+    /// ACP select options applied and acknowledged before any prompt (e.g. model).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config_options: BTreeMap<String, String>,
 }
 
 /// Provider-specific delivery is explicit; ordinary ACP never receives concurrent prompts.
@@ -59,6 +62,8 @@ pub enum Steering {
     ConcurrentPrompt,
     /// Grok Build's native safe-point interjection, including late-turn drainage.
     GrokInterject,
+    /// Advertised `_session/steering`, with an explicit idle-race continuation.
+    SessionSteering,
 }
 impl Steering {
     fn is_after_turn(&self) -> bool {
