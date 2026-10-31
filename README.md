@@ -2,7 +2,7 @@
 
 Bring your own coding agent into a Matrix room. Mention its bot account to start work; it replies in a thread, and follow-up messages in that thread resume the same agent session. Written in Rust using the official Matrix and Agent Client Protocol SDKs.
 
-**Early working prototype.** Encrypted mentions, threaded answers, and contextual follow-ups across a bridge restart have been exercised with stock Element and Codex ACP on Linux. Grok Build has also been verified with encrypted threads, native non-interrupting steering, session continuation and Matrix MCP tools. Other ACP adapters remain configurable. See [compatibility and limits](docs/COMPATIBILITY.md).
+**Early working prototype.** Encrypted mentions, threaded answers, and contextual follow-ups across a bridge restart have been exercised with stock Element and Codex ACP on Linux. Grok Build has also been verified with encrypted threads, native non-interrupting steering, session continuation and Matrix MCP tools. Maple Work has also been verified with DeepSeek Flash, encrypted explicit sends, session continuation and native steering. Other ACP adapters remain configurable. See [compatibility and limits](docs/COMPATIBILITY.md).
 
 - Normal bot accounts on a compatible hosted or self-hosted Matrix server. No Matrix administrator token or server modification.
 - Your choice of ACP stdio agent, optional permission mode, workspace and credentials.
