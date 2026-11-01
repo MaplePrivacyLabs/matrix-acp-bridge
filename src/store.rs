@@ -83,6 +83,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS inbox(room TEXT NOT NULL, event TEXT NOT NULL, PRIMARY KEY(room,event));
             CREATE TABLE IF NOT EXISTS conversations(key TEXT PRIMARY KEY, room TEXT NOT NULL, root TEXT, policy TEXT NOT NULL, audience TEXT NOT NULL, session TEXT);
+            CREATE TABLE IF NOT EXISTS conversation_workspaces(conversation TEXT PRIMARY KEY REFERENCES conversations(key), workspace TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, conversation TEXT NOT NULL REFERENCES conversations(key), prompt TEXT NOT NULL, status TEXT NOT NULL, created INTEGER NOT NULL);
             CREATE UNIQUE INDEX IF NOT EXISTS one_active_run ON runs(conversation) WHERE status IN ('queued','running','waiting_approval','cancelling');
             CREATE TABLE IF NOT EXISTS outbox(txn TEXT PRIMARY KEY, conversation TEXT NOT NULL REFERENCES conversations(key), body TEXT NOT NULL, delivered_event TEXT, created INTEGER NOT NULL);
@@ -119,6 +120,33 @@ impl Store {
         db.execute("INSERT OR IGNORE INTO meta VALUES('bot',?1)", [bot])?;
         crate::context_ledger::initialize(&db)?;
         Ok(Self { db, _lock: lock })
+    }
+
+    /// Bind pre-upgrade conversations before changing the default workspace.
+    pub fn pin_legacy_workspaces(&self, workspace: &Path) -> Result<()> {
+        let workspace = workspace.to_str().context("workspace must be UTF-8")?;
+        self.db.execute(
+            "INSERT OR IGNORE INTO conversation_workspaces SELECT key,?1 FROM conversations",
+            [workspace],
+        )?;
+        Ok(())
+    }
+
+    pub fn conversation_workspace(&self, key: &str) -> Result<Option<std::path::PathBuf>> {
+        let workspace: Option<String> = self
+            .db
+            .query_row(
+                "SELECT workspace FROM conversation_workspaces WHERE conversation=?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let workspace = workspace.map(std::path::PathBuf::from);
+        ensure!(
+            workspace.as_ref().is_none_or(|path| path.is_absolute()),
+            "stored workspace must be absolute"
+        );
+        Ok(workspace)
     }
 
     pub fn run(&self, id: &str) -> Result<Option<Run>> {

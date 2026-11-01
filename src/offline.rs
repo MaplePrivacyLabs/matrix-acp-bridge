@@ -32,6 +32,7 @@ pub struct Observations {
     pub prompts: Vec<String>,
     pub loaded: Vec<String>,
     pub new_sessions: usize,
+    pub workspaces: Vec<std::path::PathBuf>,
     pub decisions: Vec<String>,
     pub client_tools_disabled: bool,
     pub cancellations: usize,
@@ -85,16 +86,21 @@ impl FixtureAgent {
                 }
                 responder.respond(response)
             },agent_client_protocol::on_receive_request!())
-            .on_receive_request(async move |_request: NewSessionRequest,responder,_cx| {
+            .on_receive_request(async move |request: NewSessionRequest,responder,_cx| {
                 let mut obs = obs_new.lock().expect("fixture lock");
                 obs.new_sessions += 1;
+                obs.workspaces.push(request.cwd);
                 let mut value=json!({"sessionId":format!("fixture-{}",obs.new_sessions)});
                 if !matches!(behavior,Behavior::NoModes) { value["modes"]=modes(); }
                 let response: NewSessionResponse = serde_json::from_value(value).expect("valid fixture");
                 responder.respond(response)
             },agent_client_protocol::on_receive_request!())
             .on_receive_request(async move |request: LoadSessionRequest,responder,cx| {
-                obs_load.lock().expect("fixture lock").loaded.push(request.session_id.to_string());
+                {
+                    let mut obs = obs_load.lock().expect("fixture lock");
+                    obs.loaded.push(request.session_id.to_string());
+                    obs.workspaces.push(request.cwd);
+                }
                 cx.send_notification(SessionNotification::new(request.session_id,SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new("OLD HISTORY MUST NOT BE REPOSTED"))))))?;
                 responder.respond(serde_json::from_value::<LoadSessionResponse>(json!({"modes":modes()})).expect("valid fixture"))
             },agent_client_protocol::on_receive_request!())

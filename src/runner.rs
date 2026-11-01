@@ -124,7 +124,7 @@ impl Runner {
             match effect {
                 Effect::Start { run_id } => {
                     let run = self.bridge.started(run_id)?;
-                    let harness = self.bridge.config.harness.clone();
+                    let harness = self.bridge.conversation_harness(&run.conversation.key)?;
                     let transport = (self.factory)(&harness);
                     let explicit = self
                         .bridge

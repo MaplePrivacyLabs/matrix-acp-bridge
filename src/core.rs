@@ -50,7 +50,23 @@ impl Bridge {
 
     pub fn new(config: Config, store: Store) -> Result<Self> {
         config.validate()?;
+        store.pin_legacy_workspaces(&config.harness.workspace)?;
         Ok(Self { config, store })
+    }
+
+    /// The default applies only until a conversation is first admitted.
+    pub fn conversation_harness(&self, key: &str) -> Result<crate::config::HarnessConfig> {
+        let mut harness = self.config.harness.clone();
+        if let Some(workspace) = self.store.conversation_workspace(key)? {
+            harness.workspace = workspace;
+        }
+        Ok(harness)
+    }
+
+    fn conversation_binding(&self, key: &str, room: &str) -> Result<String> {
+        let mut config = self.config.clone();
+        config.harness = self.conversation_harness(key)?;
+        Ok(config.binding_fingerprint(room))
     }
 
     pub fn authorized(&self, event: &Incoming, room: &RoomSnapshot) -> bool {
@@ -103,7 +119,7 @@ impl Bridge {
             return Ok(Err(Disposition::Denied));
         }
         let conversation = self.conversation(event);
-        let policy_hash = self.config.binding_fingerprint(&event.room_id);
+        let policy_hash = self.conversation_binding(&conversation.key, &event.room_id)?;
         let audience_hash = self
             .config
             .room(&event.room_id)
@@ -201,7 +217,7 @@ impl Bridge {
             Ok(conversation) => conversation,
             Err(disposition) => return Ok(Handled::new(disposition)),
         };
-        let policy_hash = self.config.binding_fingerprint(&event.room_id);
+        let policy_hash = self.conversation_binding(&conversation.key, &event.room_id)?;
         let audience_hash = self
             .config
             .room(&event.room_id)
@@ -218,6 +234,10 @@ impl Bridge {
             .map(|p| p.prompt.clone())
             .unwrap_or_else(|| event.body.clone());
 
+        let workspace = self.conversation_harness(&conversation.key)?.workspace;
+        let workspace = workspace
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("workspace must be UTF-8"))?;
         let tx = self.store.db.transaction()?;
         if tx.execute(
             "INSERT OR IGNORE INTO inbox(room,event) VALUES(?1,?2)",
@@ -227,6 +247,10 @@ impl Bridge {
             return Ok(Handled::new(Disposition::Duplicate));
         }
         tx.execute("INSERT OR IGNORE INTO conversations(key,room,root,policy,audience) VALUES(?1,?2,?3,?4,?5)", params![conversation.key,conversation.room_id,conversation.thread_root,policy_hash,audience_hash])?;
+        tx.execute(
+            "INSERT OR IGNORE INTO conversation_workspaces VALUES(?1,?2)",
+            params![conversation.key, workspace],
+        )?;
         let active: Option<(String,String)> = tx.query_row("SELECT id,status FROM runs WHERE conversation=?1 AND status IN ('queued','running','waiting_approval','cancelling')", [&conversation.key], |r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         let mut effects = vec![];
         if command {
@@ -623,7 +647,8 @@ impl Bridge {
                 [&run.conversation.key],
                 |r| r.get(0),
             )?;
-            if policy != self.config.binding_fingerprint(&run.conversation.room_id)
+            if policy
+                != self.conversation_binding(&run.conversation.key, &run.conversation.room_id)?
                 || !self.automatic_tools(&run.conversation)?
             {
                 continue;
@@ -667,7 +692,7 @@ impl Bridge {
                 [&conversation],
                 |r| r.get(0),
             )?;
-            if policy != self.config.binding_fingerprint(&room) {
+            if policy != self.conversation_binding(&conversation, &room)? {
                 continue;
             }
             let rows: Vec<(String, String)> = {
@@ -755,13 +780,13 @@ impl Bridge {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
+        let binding = self.conversation_binding(&conversation.key, &conversation.room_id)?;
         Ok(snapshot.joined
             && snapshot.encrypted
             && snapshot.members.contains(&self.config.bot_user_id)
             && policy.permits_members(&snapshot.members)
             && expected.is_some_and(|(p, a)| {
-                p == self.config.binding_fingerprint(&conversation.room_id)
-                    && a == policy.audience_binding(&snapshot.members)
+                p == binding && a == policy.audience_binding(&snapshot.members)
             }))
     }
 

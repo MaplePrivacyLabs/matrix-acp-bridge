@@ -51,3 +51,18 @@ The adapter receives the explicit environment in `[harness.env]`. Add provider-s
 - Review logs before sharing them. Do not attach credentials, journal databases or state directories to public issues.
 
 An [optional split-identity recipe](SPLIT-IDENTITIES.md) remains available for operators who explicitly want two service accounts. `ops/install-linux.sh` implements that advanced layout; it is not needed for the normal setup above.
+
+## Changing the default workspace
+
+Each admitted conversation keeps its original ACP workspace, including across
+bridge restarts. Changing `harness.workspace` affects only new conversations;
+other session-binding and access-policy checks still apply to existing ones.
+An existing session is never silently moved to a different project folder.
+
+When first upgrading from a version without stored conversation workspaces,
+start the new bridge once with the **old** workspace configuration. This records
+that folder for existing conversations. Then stop it while idle, change the
+default, validate configuration and restart. Do not combine the first upgrade
+with a workspace change: the old journal cannot identify its original folder.
+Keep the journal and configuration backed up; do not reset session IDs or replay
+messages for a folder change. This setting does not update repository checkouts.
