@@ -665,3 +665,46 @@ fn schema_one_upgrade_preserves_existing_runs_and_text_delivery() {
     assert_eq!(preserved.body, "Legacy accepted status");
     assert!(preserved.reaction.is_none());
 }
+
+#[test]
+fn legacy_journal_pins_the_previous_workspace_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let old = config();
+    let mut bridge =
+        Bridge::new(old.clone(), Store::open(&state, &old.bot_user_id).unwrap()).unwrap();
+    let run_id = start(&mut bridge, "legacy");
+    let conversation = bridge.store.run(&run_id).unwrap().unwrap().conversation;
+    drop(bridge);
+    // Simulate a pre-upgrade database without the new additive table.
+    let db = rusqlite::Connection::open(state.join("journal.sqlite")).unwrap();
+    db.execute("DROP TABLE conversation_workspaces", [])
+        .unwrap();
+    drop(db);
+    let bridge = Bridge::new(old.clone(), Store::open(&state, &old.bot_user_id).unwrap()).unwrap();
+    assert_eq!(
+        bridge
+            .conversation_harness(&conversation.key)
+            .unwrap()
+            .workspace,
+        old.harness.workspace
+    );
+    drop(bridge);
+    let mut changed = old.clone();
+    changed.harness.workspace = "/srv/new-entry".into();
+    let bridge = Bridge::new(changed, Store::open(&state, &old.bot_user_id).unwrap()).unwrap();
+    assert_eq!(
+        bridge
+            .conversation_harness(&conversation.key)
+            .unwrap()
+            .workspace,
+        old.harness.workspace
+    );
+    assert_eq!(
+        bridge
+            .conversation_harness("new-conversation")
+            .unwrap()
+            .workspace,
+        std::path::PathBuf::from("/srv/new-entry")
+    );
+}

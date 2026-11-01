@@ -310,3 +310,74 @@ async fn unadvertised_http_mcp_prevents_prompt() {
     assert_eq!(finish(&mut runner).await, RunStatus::Failed);
     assert!(agent.observations.lock().unwrap().prompts.is_empty());
 }
+
+#[tokio::test]
+async fn new_workspace_default_preserves_resumed_sessions_and_delivery_policy() {
+    for audience in [
+        matrix_acp_bridge::config::AudiencePolicy::Configured,
+        matrix_acp_bridge::config::AudiencePolicy::RoomMembership,
+    ] {
+        let (mut runner, agent) = fixture(Behavior::Reply);
+        runner.bridge.config.rooms[0].audience_policy = audience;
+        let old = runner.bridge.config.harness.workspace.clone();
+        runner
+            .ingest(&message("old", "original", None), &room(), 100)
+            .await
+            .unwrap();
+        assert_eq!(finish(&mut runner).await, RunStatus::Completed);
+        let new = std::path::PathBuf::from("/srv/development-entry");
+        runner.bridge.config.harness.workspace = new.clone();
+        // Exercise persistence across a bridge restart, without changing provider sessions.
+        runner.bridge = matrix_acp_bridge::core::Bridge::new(
+            runner.bridge.config.clone(),
+            std::mem::replace(
+                &mut runner.bridge.store,
+                matrix_acp_bridge::store::Store::memory(&config().bot_user_id).unwrap(),
+            ),
+        )
+        .unwrap();
+        let followup = runner
+            .ingest(&message("follow", "continue", Some("$old")), &room(), 101)
+            .await
+            .unwrap();
+        assert!(matches!(
+            followup.effects.first(),
+            Some(Effect::Start { .. })
+        ));
+        assert_eq!(finish(&mut runner).await, RunStatus::Completed);
+        runner
+            .ingest(&message("new", "new topic", None), &room(), 102)
+            .await
+            .unwrap();
+        assert_eq!(finish(&mut runner).await, RunStatus::Completed);
+        {
+            let obs = agent.observations.lock().unwrap();
+            assert_eq!(obs.workspaces, vec![old.clone(), old, new]);
+            assert_eq!(obs.loaded, vec!["fixture-1"]);
+        }
+        for outgoing in runner.bridge.store.pending().unwrap() {
+            assert!(runner.bridge.may_deliver(&outgoing, &room()).unwrap());
+        }
+        // Pinning the folder must not bypass unrelated harness or audience changes.
+        runner
+            .bridge
+            .config
+            .harness
+            .env
+            .insert("ACCESS_SCOPE".into(), "changed".into());
+        assert_eq!(
+            runner
+                .ingest(&message("denied", "continue", Some("$old")), &room(), 103)
+                .await
+                .unwrap()
+                .disposition,
+            Disposition::Denied
+        );
+        assert!(
+            !runner
+                .bridge
+                .may_deliver(&runner.bridge.store.pending().unwrap()[0], &room())
+                .unwrap()
+        );
+    }
+}
