@@ -11,7 +11,8 @@ use matrix_sdk::{
     Client, Room, RoomMemberships, RoomState,
     config::{SyncSettings, SyncToken},
     deserialized_responses::{
-        TimelineEvent, TimelineEventKind, VerificationLevel, VerificationState,
+        TimelineEvent, TimelineEventKind, UnableToDecryptReason, VerificationLevel,
+        VerificationState,
     },
     room::{IncludeRelations, MessagesOptions, RelationsOptions},
 };
@@ -35,6 +36,35 @@ use crate::{
 /// Verification is still required separately when admitting agent commands.
 /// The SDK continues to exclude devices explicitly marked as blocked.
 pub const REPLY_KEY_RECIPIENT_STRATEGY: CollectStrategy = CollectStrategy::AllDevices;
+
+/// Missing keys are recoverable synchronization state, not a broken worker.
+#[derive(Debug, thiserror::Error)]
+#[error("awaiting encryption key for room {room}: {reason:?}; encrypted events remain staged")]
+pub struct AwaitingRoomKey {
+    room: String,
+    reason: UnableToDecryptReason,
+}
+
+fn require_decrypted(room: &str, event: &TimelineEvent) -> Result<()> {
+    if let TimelineEventKind::UnableToDecrypt { utd_info, .. } = &event.kind {
+        if matches!(
+            utd_info.reason,
+            UnableToDecryptReason::MissingMegolmSession { .. }
+                | UnableToDecryptReason::UnknownMegolmMessageIndex
+        ) {
+            return Err(AwaitingRoomKey {
+                room: room.into(),
+                reason: utd_info.reason.clone(),
+            }
+            .into());
+        }
+        anyhow::bail!(
+            "room {room} event decryption failed: {:?}; retain encrypted events",
+            utd_info.reason
+        );
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct MatrixAdapter {
@@ -206,10 +236,7 @@ impl MatrixAdapter {
                 }
                 let encrypted = Raw::from_json(raw.into_json());
                 let event = room.decrypt_event(&encrypted, None).await?;
-                ensure!(
-                    !matches!(event.kind, TimelineEventKind::UnableToDecrypt { .. }),
-                    "room has an undecryptable event; retain the cursor for key recovery"
-                );
+                require_decrypted(&room_id, &event)?;
                 if let Some(incoming) = decode(room_id.as_str(), &event)? {
                     events.push((incoming, snapshot.clone()));
                 }
@@ -424,10 +451,7 @@ impl MatrixAdapter {
 }
 
 fn append_context(room: &str, event: &TimelineEvent, history: &mut Vec<Incoming>) -> Result<()> {
-    ensure!(
-        !matches!(event.kind, TimelineEventKind::UnableToDecrypt { .. }),
-        "conversation context contains an undecryptable event; retain the request for key recovery"
-    );
+    require_decrypted(room, event)?;
     if let Some(message) = decode(room, event)? {
         history.push(message);
     }
@@ -454,10 +478,7 @@ async fn backfill_to_anchor(room: &Room, start: &str, anchor: &str) -> Result<Ve
                 reversed.reverse();
                 return Ok(reversed);
             }
-            ensure!(
-                !matches!(event.kind, TimelineEventKind::UnableToDecrypt { .. }),
-                "backfilled room has an undecryptable event; retain staged cursor"
-            );
+            require_decrypted(room.room_id().as_str(), &event)?;
             reversed.push(event);
         }
         token = page.end.ok_or_else(|| {
@@ -610,4 +631,72 @@ pub fn render(message: &Outbound) -> Result<RoomMessageEventContent> {
         content.relates_to = Some(Relation::Thread(Thread::plain(root.clone(), root)));
     }
     Ok(content)
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use matrix_sdk::deserialized_responses::UnableToDecryptInfo;
+
+    fn unreadable(reason: UnableToDecryptReason) -> TimelineEvent {
+        let raw = serde_json::from_value(serde_json::json!({
+            "event_id":"$pending", "sender":"@sender:example.invalid",
+            "origin_server_ts":1, "type":"m.room.encrypted", "content":{}
+        }))
+        .unwrap();
+        TimelineEvent::from_utd(
+            raw,
+            UnableToDecryptInfo {
+                session_id: Some("fixture".into()),
+                reason,
+            },
+        )
+    }
+
+    #[test]
+    fn missing_keys_are_retryable_without_consuming_the_encrypted_batch() {
+        let mut store = Store::memory("@bot:example.invalid").unwrap();
+        store.checkpoint_sync("before").unwrap();
+        store.stage_sync("after", "encrypted fixture").unwrap();
+        for reason in [
+            UnableToDecryptReason::MissingMegolmSession {
+                withheld_code: None,
+            },
+            UnableToDecryptReason::UnknownMegolmMessageIndex,
+        ] {
+            let event = unreadable(reason);
+            for _ in 0..10 {
+                let error = require_decrypted("!room:example.invalid", &event)
+                    .unwrap_err()
+                    .context("sync");
+                assert!(error.is::<AwaitingRoomKey>());
+            }
+            let mut history = vec![];
+            assert!(
+                append_context("!room:example.invalid", &event, &mut history)
+                    .unwrap_err()
+                    .is::<AwaitingRoomKey>()
+            );
+            assert!(history.is_empty());
+        }
+        assert_eq!(store.sync_token().unwrap().as_deref(), Some("before"));
+        assert_eq!(
+            store.staged_sync().unwrap(),
+            Some(("after".into(), "encrypted fixture".into()))
+        );
+        assert_eq!(store.count_runs().unwrap(), 0);
+    }
+
+    #[test]
+    fn integrity_and_identity_errors_are_not_downgraded_to_missing_keys() {
+        for reason in [
+            UnableToDecryptReason::MismatchedIdentityKeys,
+            UnableToDecryptReason::MegolmDecryptionFailure,
+            UnableToDecryptReason::MalformedEncryptedEvent,
+        ] {
+            let error =
+                require_decrypted("!room:example.invalid", &unreadable(reason)).unwrap_err();
+            assert!(!error.is::<AwaitingRoomKey>());
+        }
+    }
 }
