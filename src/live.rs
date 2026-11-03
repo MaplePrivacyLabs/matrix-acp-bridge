@@ -201,11 +201,11 @@ async fn configured_event(
 
 /// Read-only context diagnostic. No ACP connection or message body output.
 pub async fn inspect_context(config: Config, event_id: &str) -> Result<()> {
-    let store = Store::open(&config.state_dir, &config.bot_user_id)?;
+    let mut store = Store::open(&config.state_dir, &config.bot_user_id)?;
     let client = restore_client(&config).await?;
     let event = configured_event(&client, &config, event_id).await?;
     let adapter = MatrixAdapter::from_client(&config, client)?;
-    let history = adapter.context_for(&event).await?;
+    let history = adapter.context_for(&event, &mut store).await?;
     let snapshot = adapter.snapshot(&event.room_id).await?;
     let bridge = Bridge::new(config.clone(), store)?;
     let prepared = bridge.prepare_context(&event, &history)?;
@@ -581,7 +581,9 @@ pub async fn run(config: Config, retry_event: Option<&str>) -> Result<()> {
     if let Some(event_id) = retry_event {
         let event = configured_event(adapter.client(), &runner.bridge.config, event_id).await?;
         let snapshot = adapter.snapshot(&event.room_id).await?;
-        let context = adapter.context_for(&event).await?;
+        let context = adapter
+            .context_for(&event, &mut runner.bridge.store)
+            .await?;
         let handled = runner
             .ingest_with_context(&event, &snapshot, Some(&context), now())
             .await?;

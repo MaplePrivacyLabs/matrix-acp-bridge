@@ -230,3 +230,56 @@ fn legacy_successful_json_prompts_seed_the_ledger_without_replaying_history() {
     assert!(!prepared.initial);
     assert_eq!(prepared.prompt, "@owner:example.invalid: SHORT_REPLY");
 }
+
+#[tokio::test]
+async fn missing_context_is_explicit_and_later_recovered_plaintext_is_delivered_once() {
+    let (mut runner, agent) = fixture(Behavior::Reply);
+    let mut gap = message("lost", "MUST_NOT_BECOME_CONTENT", None);
+    gap.unavailable = true;
+    gap.verified_device = false;
+    gap.known_sender_device = false;
+    runner
+        .ingest_with_context(
+            &message("request", "fresh request", None),
+            &room(),
+            Some(&[gap.clone()]),
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(finish(&mut runner).await, RunStatus::Completed);
+    let mut reply_gap = gap.clone();
+    reply_gap.thread_root = Some("$request".into());
+    runner
+        .ingest_with_context(
+            &message("follow", "continue", Some("$request")),
+            &room(),
+            Some(&[reply_gap.clone()]),
+            101,
+        )
+        .await
+        .unwrap();
+    assert_eq!(finish(&mut runner).await, RunStatus::Completed);
+    reply_gap.unavailable = false;
+    reply_gap.body = "RECOVERED_CONTEXT".into();
+    runner
+        .ingest_with_context(
+            &message("later", "new request", Some("$request")),
+            &room(),
+            Some(&[reply_gap]),
+            102,
+        )
+        .await
+        .unwrap();
+    assert_eq!(finish(&mut runner).await, RunStatus::Completed);
+    let obs = agent.observations.lock().unwrap();
+    assert!(obs.prompts[0].contains("[context unavailable]"));
+    assert!(
+        !obs.prompts
+            .iter()
+            .any(|p| p.contains("MUST_NOT_BECOME_CONTENT"))
+    );
+    assert_eq!(obs.prompts[1], "@owner:example.invalid: continue");
+    assert!(obs.prompts[2].contains("RECOVERED_CONTEXT"));
+    assert_eq!(obs.new_sessions, 1);
+}

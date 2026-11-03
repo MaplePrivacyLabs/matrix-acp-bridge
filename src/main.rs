@@ -219,6 +219,7 @@ async fn demo(scenario: Scenario) -> Result<()> {
         members: config.rooms[0].audience.clone(),
     };
     let message = |id: &str, body: &str, thread: Option<&str>| Incoming {
+        unavailable: false,
         event_id: format!("${id}"),
         room_id: config.rooms[0].room_id.clone(),
         sender: "@owner:example.invalid".into(),

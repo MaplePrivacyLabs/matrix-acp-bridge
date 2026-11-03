@@ -26,7 +26,7 @@ use ruma::{api::client::sync::sync_events, serde::Raw};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::Config,
+    config::{Config, MissingKeyPolicy},
     model::{Attachment, Incoming, Outbound, RoomSnapshot},
     runner::Runner,
     store::Store,
@@ -70,6 +70,7 @@ fn require_decrypted(room: &str, event: &TimelineEvent) -> Result<()> {
 pub struct MatrixAdapter {
     client: Client,
     allowed_rooms: BTreeSet<String>,
+    missing_key_policy: MissingKeyPolicy,
 }
 
 pub struct Batch {
@@ -102,6 +103,7 @@ impl MatrixAdapter {
         );
         Ok(Self {
             client,
+            missing_key_policy: config.missing_key_policy,
             allowed_rooms: config.rooms.iter().map(|r| r.room_id.clone()).collect(),
         })
     }
@@ -217,7 +219,10 @@ impl MatrixAdapter {
                     )
                 })?;
                 for event in backfill_to_anchor(&room, start, &anchor).await? {
-                    if let Some(incoming) = decode(room_id.as_str(), &event)? {
+                    if let Some(incoming) =
+                        decode_with_recovery(&room_id, &event, self.missing_key_policy, store)?
+                        && !incoming.unavailable
+                    {
                         events.push((incoming, snapshot.clone()));
                     }
                 }
@@ -236,8 +241,10 @@ impl MatrixAdapter {
                 }
                 let encrypted = Raw::from_json(raw.into_json());
                 let event = room.decrypt_event(&encrypted, None).await?;
-                require_decrypted(&room_id, &event)?;
-                if let Some(incoming) = decode(room_id.as_str(), &event)? {
+                if let Some(incoming) =
+                    decode_with_recovery(&room_id, &event, self.missing_key_policy, store)?
+                    && !incoming.unavailable
+                {
                     events.push((incoming, snapshot.clone()));
                 }
             }
@@ -313,7 +320,7 @@ impl MatrixAdapter {
 
     /// All decrypted text in the thread up to this request, including a parent
     /// written by a reader. Relations are paginated: there is no hidden thread cap.
-    pub async fn context_for(&self, event: &Incoming) -> Result<Vec<Incoming>> {
+    pub async fn context_for(&self, event: &Incoming, store: &mut Store) -> Result<Vec<Incoming>> {
         ensure!(
             self.allowed_rooms.contains(&event.room_id),
             "room is not configured"
@@ -327,7 +334,14 @@ impl MatrixAdapter {
             let root_id: ruma::OwnedEventId = root.parse()?;
             let parent = room.event(&root_id, None).await?;
             let mut history = vec![];
-            append_context(&event.room_id, &parent, &mut history)?;
+            append_context_with_recovery(
+                &event.room_id,
+                &parent,
+                &mut history,
+                self.missing_key_policy,
+                store,
+                event.thread_root.as_deref(),
+            )?;
             let mut from = None;
             let mut tokens = BTreeSet::new();
             loop {
@@ -345,7 +359,14 @@ impl MatrixAdapter {
                     {
                         return Ok(history);
                     }
-                    append_context(&event.room_id, &item, &mut history)?;
+                    append_context_with_recovery(
+                        &event.room_id,
+                        &item,
+                        &mut history,
+                        self.missing_key_policy,
+                        store,
+                        event.thread_root.as_deref(),
+                    )?;
                 }
                 let next = page.next_batch_token.ok_or_else(|| {
                     anyhow::anyhow!("thread history did not reach the triggering event")
@@ -365,14 +386,28 @@ impl MatrixAdapter {
                 .await?;
             let mut history = vec![];
             for item in page.events_before.into_iter().rev() {
-                append_context(&event.room_id, &item, &mut history)?;
+                append_context_with_recovery(
+                    &event.room_id,
+                    &item,
+                    &mut history,
+                    self.missing_key_policy,
+                    store,
+                    event.thread_root.as_deref(),
+                )?;
             }
             if let Some(reply) = &event.reply_to
                 && !history.iter().any(|e| &e.event_id == reply)
             {
                 let reply_id: ruma::OwnedEventId = reply.parse()?;
                 let target = room.event(&reply_id, None).await?;
-                append_context(&event.room_id, &target, &mut history)?;
+                append_context_with_recovery(
+                    &event.room_id,
+                    &target,
+                    &mut history,
+                    self.missing_key_policy,
+                    store,
+                    event.thread_root.as_deref(),
+                )?;
             }
             Ok(history)
         }
@@ -389,7 +424,7 @@ impl MatrixAdapter {
         }
         for (event, snapshot) in &batch.events {
             let context = if runner.bridge.needs_context(event, snapshot)? {
-                Some(self.context_for(event).await?)
+                Some(self.context_for(event, &mut runner.bridge.store).await?)
             } else {
                 None
             };
@@ -450,9 +485,66 @@ impl MatrixAdapter {
     }
 }
 
-fn append_context(room: &str, event: &TimelineEvent, history: &mut Vec<Incoming>) -> Result<()> {
-    require_decrypted(room, event)?;
-    if let Some(message) = decode(room, event)? {
+fn decode_with_recovery(
+    room: &str,
+    event: &TimelineEvent,
+    policy: MissingKeyPolicy,
+    store: &mut Store,
+) -> Result<Option<Incoming>> {
+    if let Err(error) = require_decrypted(room, event) {
+        if policy != MissingKeyPolicy::Quarantine || !error.is::<AwaitingRoomKey>() {
+            return Err(error);
+        }
+        let event_id: ruma::OwnedEventId = event
+            .raw()
+            .get_field::<String>("event_id")?
+            .ok_or_else(|| anyhow::anyhow!("unreadable event missing ID"))?
+            .parse()?;
+        let sender: ruma::OwnedUserId = event
+            .raw()
+            .get_field::<String>("sender")?
+            .ok_or_else(|| anyhow::anyhow!("unreadable event missing sender"))?
+            .parse()?;
+        if store.quarantine_event(
+            room,
+            event_id.as_str(),
+            event.raw().json().get(),
+            &error.to_string(),
+        )? {
+            eprintln!(
+                "Archived unreadable encrypted event {event_id} in {room}; it will not be executed or automatically replayed"
+            );
+        }
+        return Ok(Some(Incoming {
+            unavailable: true,
+            event_id: event_id.to_string(),
+            room_id: room.into(),
+            sender: sender.to_string(),
+            body: String::new(),
+            attachment: None,
+            thread_root: None,
+            reply_to: None,
+            mentions: BTreeSet::new(),
+            encrypted: true,
+            verified_device: false,
+            known_sender_device: false,
+        }));
+    }
+    decode(room, event)
+}
+
+fn append_context_with_recovery(
+    room: &str,
+    event: &TimelineEvent,
+    history: &mut Vec<Incoming>,
+    policy: MissingKeyPolicy,
+    store: &mut Store,
+    root: Option<&str>,
+) -> Result<()> {
+    if let Some(mut message) = decode_with_recovery(room, event, policy, store)? {
+        if message.unavailable {
+            message.thread_root = root.map(str::to_owned);
+        }
         history.push(message);
     }
     Ok(())
@@ -478,7 +570,6 @@ async fn backfill_to_anchor(room: &Room, start: &str, anchor: &str) -> Result<Ve
                 reversed.reverse();
                 return Ok(reversed);
             }
-            require_decrypted(room.room_id().as_str(), &event)?;
             reversed.push(event);
         }
         token = page.end.ok_or_else(|| {
@@ -603,6 +694,7 @@ pub fn decode(room_id: &str, event: &TimelineEvent) -> Result<Option<Incoming>> 
         _ => return Ok(None),
     };
     Ok(Some(Incoming {
+        unavailable: false,
         event_id: message.event_id.to_string(),
         room_id: room_id.into(),
         sender: message.sender.to_string(),
@@ -673,9 +765,16 @@ mod recovery_tests {
             }
             let mut history = vec![];
             assert!(
-                append_context("!room:example.invalid", &event, &mut history)
-                    .unwrap_err()
-                    .is::<AwaitingRoomKey>()
+                append_context_with_recovery(
+                    "!room:example.invalid",
+                    &event,
+                    &mut history,
+                    MissingKeyPolicy::Wait,
+                    &mut store,
+                    None
+                )
+                .unwrap_err()
+                .is::<AwaitingRoomKey>()
             );
             assert!(history.is_empty());
         }
@@ -685,6 +784,84 @@ mod recovery_tests {
             Some(("after".into(), "encrypted fixture".into()))
         );
         assert_eq!(store.count_runs().unwrap(), 0);
+    }
+
+    #[test]
+    fn quarantined_ciphertext_survives_checkpoint_and_restart_but_cannot_authorize_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let config = Config::parse(include_str!("../config/example.toml")).unwrap();
+        let mut store = Store::open(&state, &config.bot_user_id).unwrap();
+        store.stage_sync("new-cursor", "saved sync").unwrap();
+        let event = unreadable(UnableToDecryptReason::MissingMegolmSession {
+            withheld_code: None,
+        });
+        let mut gap = decode_with_recovery(
+            "!room:example.invalid",
+            &event,
+            MissingKeyPolicy::Quarantine,
+            &mut store,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(gap.unavailable && !gap.verified_device && gap.body.is_empty());
+        decode_with_recovery(
+            "!room:example.invalid",
+            &event,
+            MissingKeyPolicy::Quarantine,
+            &mut store,
+        )
+        .unwrap();
+        store.checkpoint_sync("new-cursor").unwrap();
+        drop(store);
+        let store = Store::open(&state, &config.bot_user_id).unwrap();
+        assert!(store.staged_sync().unwrap().is_none());
+        assert_eq!(store.sync_token().unwrap().as_deref(), Some("new-cursor"));
+        let (count, wire): (i64, String) = store
+            .db
+            .query_row("SELECT count(*),wire FROM unreadable_events", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(wire, event.raw().json().get());
+        // Even a mistakenly trusted/mentioned placeholder remains incapable of admission.
+        gap.sender = config.rooms[0].operators.iter().next().unwrap().clone();
+        gap.room_id = config.rooms[0].room_id.clone();
+        gap.verified_device = true;
+        gap.known_sender_device = true;
+        gap.mentions.insert(config.bot_user_id.clone());
+        let snapshot = RoomSnapshot {
+            joined: true,
+            encrypted: true,
+            members: config.rooms[0].audience.clone(),
+        };
+        let mut bridge = crate::core::Bridge::new(config, store).unwrap();
+        assert_eq!(
+            bridge.handle(&gap, &snapshot, 100).unwrap().disposition,
+            crate::model::Disposition::Denied
+        );
+        assert_eq!(bridge.store.count_runs().unwrap(), 0);
+    }
+
+    #[test]
+    fn quarantine_does_not_accept_integrity_failures() {
+        let mut store = Store::memory("@bot:example.invalid").unwrap();
+        let bad = unreadable(UnableToDecryptReason::MismatchedIdentityKeys);
+        assert!(
+            decode_with_recovery(
+                "!room:example.invalid",
+                &bad,
+                MissingKeyPolicy::Quarantine,
+                &mut store
+            )
+            .is_err()
+        );
+        let count: i64 = store
+            .db
+            .query_row("SELECT count(*) FROM unreadable_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

@@ -84,6 +84,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS inbox(room TEXT NOT NULL, event TEXT NOT NULL, PRIMARY KEY(room,event));
             CREATE TABLE IF NOT EXISTS conversations(key TEXT PRIMARY KEY, room TEXT NOT NULL, root TEXT, policy TEXT NOT NULL, audience TEXT NOT NULL, session TEXT);
             CREATE TABLE IF NOT EXISTS conversation_workspaces(conversation TEXT PRIMARY KEY REFERENCES conversations(key), workspace TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS unreadable_events(room TEXT NOT NULL, event TEXT NOT NULL, wire TEXT NOT NULL, reason TEXT NOT NULL, PRIMARY KEY(room,event));
             CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, conversation TEXT NOT NULL REFERENCES conversations(key), prompt TEXT NOT NULL, status TEXT NOT NULL, created INTEGER NOT NULL);
             CREATE UNIQUE INDEX IF NOT EXISTS one_active_run ON runs(conversation) WHERE status IN ('queued','running','waiting_approval','cancelling');
             CREATE TABLE IF NOT EXISTS outbox(txn TEXT PRIMARY KEY, conversation TEXT NOT NULL REFERENCES conversations(key), body TEXT NOT NULL, delivered_event TEXT, created INTEGER NOT NULL);
@@ -147,6 +148,20 @@ impl Store {
             "stored workspace must be absolute"
         );
         Ok(workspace)
+    }
+
+    /// Persist ciphertext before sync may advance. Archived input is never replayed as work.
+    pub fn quarantine_event(
+        &mut self,
+        room: &str,
+        event: &str,
+        wire: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        Ok(self.db.execute(
+            "INSERT OR IGNORE INTO unreadable_events VALUES(?1,?2,?3,?4)",
+            params![room, event, wire, reason],
+        )? > 0)
     }
 
     pub fn run(&self, id: &str) -> Result<Option<Run>> {

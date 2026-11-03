@@ -27,6 +27,7 @@ pub fn room() -> RoomSnapshot {
 }
 pub fn message(id: &str, body: &str, root: Option<&str>) -> Incoming {
     Incoming {
+        unavailable: false,
         event_id: format!("${id}"),
         room_id: config().rooms[0].room_id.clone(),
         sender: "@owner:example.invalid".into(),

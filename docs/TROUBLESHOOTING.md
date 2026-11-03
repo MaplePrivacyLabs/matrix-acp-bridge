@@ -39,3 +39,20 @@ The state directory contains the Matrix login session, crypto store/key and a SQ
 Stop the service for a consistent backup. Store it encrypted/access-controlled and test a restore without letting the original and restored devices connect at once. On startup, unfinished runs are marked interrupted and approvals are cancelled. Review possible filesystem/external effects before issuing a new request; exactly-once Matrix delivery does not imply exactly-once tool actions. Do not solve recovery by silently running historical messages again.
 
 For bug reports, provide versions, sanitized config, the failing command and redacted errors. Never upload the state directory, bot password, session JSON, store key, agent authentication or private conversation contents.
+
+## Keep missing keys from blocking other messages
+
+By default, `missing_key_policy = "wait"` retains the staged batch while syncing
+for keys. To keep readable messages flowing, set the top-level option
+`missing_key_policy = "quarantine"` (outside `[harness]`). Missing Megolm sessions
+or earlier indexes are then archived as ciphertext in the private journal's
+`unreadable_events` table before the cursor advances. This is a recovery archive,
+not a work queue: unreadable input never authorizes an agent request and archived
+requests are never automatically replayed if keys arrive later.
+
+Thread/context reads show an explicit unavailable-context notice. Recovered
+plaintext can be included as context on a later authorized request, without
+restarting its session. The agent must not assume missing contents. Integrity,
+identity-key and malformed-event failures still stop processing; this option does
+not weaken sender verification, room access or decryption checks. Include the
+journal in backups. Do not delete its crypto store or archive to recover a key.

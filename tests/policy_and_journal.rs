@@ -708,3 +708,15 @@ fn legacy_journal_pins_the_previous_workspace_once() {
         std::path::PathBuf::from("/srv/new-entry")
     );
 }
+
+#[test]
+fn availability_policy_keeps_existing_bindings_but_is_auditable() {
+    let mut c = config();
+    let before = c.binding_fingerprint(&c.rooms[0].room_id);
+    let full = c.fingerprint();
+    c.missing_key_policy = matrix_acp_bridge::config::MissingKeyPolicy::Quarantine;
+    assert_eq!(before, c.binding_fingerprint(&c.rooms[0].room_id));
+    assert_ne!(full, c.fingerprint());
+    c.harness.program = "/different-agent".into();
+    assert_ne!(before, c.binding_fingerprint(&c.rooms[0].room_id));
+}

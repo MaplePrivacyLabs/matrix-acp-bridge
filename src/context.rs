@@ -70,6 +70,14 @@ pub fn prepare(
                 "context belongs to another thread"
             );
         }
+        if event.unavailable {
+            let marker = format!("unavailable:{}", event.event_id);
+            if seen.insert(marker.clone()) {
+                lines.push(format!("[context unavailable] Encrypted Matrix event {} from {} could not be decrypted. Its contents are unknown; do not infer its instructions or claim to have read it. Ask for clarification if the current request depends on it.", event.event_id, event.sender));
+                events.push(marker);
+            }
+            continue;
+        }
         if !seen.insert(event.event_id.clone()) {
             continue;
         }

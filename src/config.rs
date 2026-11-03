@@ -15,6 +15,9 @@ pub struct Config {
     pub state_dir: PathBuf,
     pub harness: HarnessConfig,
     pub rooms: Vec<RoomPolicy>,
+    /// Archive unreadable encrypted events instead of holding the entire sync stream.
+    #[serde(default, skip_serializing_if = "MissingKeyPolicy::is_wait")]
+    pub missing_key_policy: MissingKeyPolicy,
     #[serde(default = "default_approval_ttl")]
     pub approval_ttl_seconds: u64,
     #[serde(default = "default_concurrency")]
@@ -22,6 +25,19 @@ pub struct Config {
     /// Optional shared socket path when bridge and agent have different OS users.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools_socket: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MissingKeyPolicy {
+    #[default]
+    Wait,
+    Quarantine,
+}
+impl MissingKeyPolicy {
+    fn is_wait(&self) -> bool {
+        *self == Self::Wait
+    }
 }
 
 fn default_approval_ttl() -> u64 {
@@ -301,7 +317,9 @@ impl Config {
             return self.fingerprint();
         };
         if room.audience_policy == AudiencePolicy::Configured {
-            return self.fingerprint();
+            let mut authority = self.clone();
+            authority.missing_key_policy = MissingKeyPolicy::Wait;
+            return authority.fingerprint();
         }
         digest(
             &serde_json::to_vec(&(
