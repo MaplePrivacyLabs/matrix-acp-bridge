@@ -2,10 +2,12 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-/// Constructed only after the Matrix transport has decrypted and authenticated an event.
+/// Decrypted transport input, or an explicitly marked unavailable context placeholder.
 /// Tests may construct fixtures. Do not deserialize this type from an untrusted HTTP API.
 #[derive(Clone, Debug)]
 pub struct Incoming {
+    /// Bridge-generated context gap; it can never authorize or start work.
+    pub unavailable: bool,
     pub event_id: String,
     pub room_id: String,
     pub sender: String,

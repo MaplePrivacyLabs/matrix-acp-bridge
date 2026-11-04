@@ -14,7 +14,7 @@ Use the same `--config /absolute/path/config.toml` throughout. For the Linux ser
 | `another worker owns this state directory` | Stop the other process/service. Never copy the same device store into a second running bridge. |
 | DNS/HTTPS timeout | Test the configured public homeserver from the worker. The bot needs ordinary HTTPS, not a private administrator endpoint. Investigate local network policy without granting the bot admin-network access. |
 | Expired/invalid Matrix token | Stop the bridge and investigate the existing device/session. Do not delete state or reenroll blindly; that can lose keys and bindings. Token refresh is persisted automatically when supported. |
-| Timeline gap / undecryptable event | The staged batch is retained. Restore connectivity/keys and restart; don't advance cursors manually. Gaps beyond the bounded backfill need additional recovery work. |
+| Timeline gap / undecryptable event | The staged batch is retained. Missing Megolm keys or an unavailable earlier message index keep the process syncing for keys instead of exhausting the fatal retry budget. New input in the retained batch waits; active-run maintenance and membership/delivery checks continue. The bot cannot recreate a key it never received: keep the sending client online and inspect key-sharing/withheld metadata. Do not advance cursors or delete the staged batch. Integrity/identity failures and gaps beyond bounded backfill remain hard failures. |
 | Missing thread context | Update the bridge: it supplies the full parent and earlier thread text automatically. Run `inspect-context` for metadata-only verification. Decryption failures retain the request rather than sending incomplete context. |
 | Too many tool approvals | Use `!bridge allow-thread` once, or deliberately configure `tool_approval = "automatic"` for an isolated worker room. `!bridge approvals manual` restores per-action approval in that conversation. |
 
@@ -39,3 +39,20 @@ The state directory contains the Matrix login session, crypto store/key and a SQ
 Stop the service for a consistent backup. Store it encrypted/access-controlled and test a restore without letting the original and restored devices connect at once. On startup, unfinished runs are marked interrupted and approvals are cancelled. Review possible filesystem/external effects before issuing a new request; exactly-once Matrix delivery does not imply exactly-once tool actions. Do not solve recovery by silently running historical messages again.
 
 For bug reports, provide versions, sanitized config, the failing command and redacted errors. Never upload the state directory, bot password, session JSON, store key, agent authentication or private conversation contents.
+
+## Keep missing keys from blocking other messages
+
+By default, `missing_key_policy = "wait"` retains the staged batch while syncing
+for keys. To keep readable messages flowing, set the top-level option
+`missing_key_policy = "quarantine"` (outside `[harness]`). Missing Megolm sessions
+or earlier indexes are then archived as ciphertext in the private journal's
+`unreadable_events` table before the cursor advances. This is a recovery archive,
+not a work queue: unreadable input never authorizes an agent request and archived
+requests are never automatically replayed if keys arrive later.
+
+Thread/context reads show an explicit unavailable-context notice. Recovered
+plaintext can be included as context on a later authorized request, without
+restarting its session. The agent must not assume missing contents. Integrity,
+identity-key and malformed-event failures still stop processing; this option does
+not weaken sender verification, room access or decryption checks. Include the
+journal in backups. Do not delete its crypto store or archive to recover a key.

@@ -73,7 +73,8 @@ impl Bridge {
         let Some(policy) = self.config.room(&event.room_id) else {
             return false;
         };
-        event.encrypted
+        !event.unavailable
+            && event.encrypted
             && (event.verified_device
                 || (event.known_sender_device && policy.operator_trust == OperatorTrust::Account))
             && room.joined

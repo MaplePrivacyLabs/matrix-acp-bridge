@@ -184,6 +184,7 @@ fn gather(
         }
     };
     let config = Config {
+        missing_key_policy: Default::default(),
         bot_user_id,
         homeserver,
         state_dir,

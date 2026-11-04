@@ -201,11 +201,11 @@ async fn configured_event(
 
 /// Read-only context diagnostic. No ACP connection or message body output.
 pub async fn inspect_context(config: Config, event_id: &str) -> Result<()> {
-    let store = Store::open(&config.state_dir, &config.bot_user_id)?;
+    let mut store = Store::open(&config.state_dir, &config.bot_user_id)?;
     let client = restore_client(&config).await?;
     let event = configured_event(&client, &config, event_id).await?;
     let adapter = MatrixAdapter::from_client(&config, client)?;
-    let history = adapter.context_for(&event).await?;
+    let history = adapter.context_for(&event, &mut store).await?;
     let snapshot = adapter.snapshot(&event.room_id).await?;
     let bridge = Bridge::new(config.clone(), store)?;
     let prepared = bridge.prepare_context(&event, &history)?;
@@ -499,22 +499,46 @@ pub async fn verify(config: Config, user_id: &str) -> Result<()> {
     anyhow::bail!("verification timed out")
 }
 
-async fn one_step(adapter: &MatrixAdapter, runner: &mut Runner) -> Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StepProgress {
+    Synced,
+    AwaitingKey,
+}
+
+async fn one_step(adapter: &MatrixAdapter, runner: &mut Runner) -> Result<StepProgress> {
     while runner.try_update()?.is_some() {}
     let batch = tokio::time::timeout(
         Duration::from_secs(15),
         adapter.poll(&mut runner.bridge.store),
     )
     .await
-    .context("Matrix sync timed out")??;
-    adapter.ingest_live_batch(runner, batch, now()).await?;
+    .context("Matrix sync timed out")?;
+    let progress = match batch {
+        Ok(batch) => match adapter.ingest_live_batch(runner, batch, now()).await {
+            Ok(()) => StepProgress::Synced,
+            Err(error) if error.is::<crate::matrix::AwaitingRoomKey>() => StepProgress::AwaitingKey,
+            Err(error) => return Err(error),
+        },
+        Err(error) if error.is::<crate::matrix::AwaitingRoomKey>() => StepProgress::AwaitingKey,
+        Err(error) => return Err(error),
+    };
+    if progress == StepProgress::AwaitingKey {
+        // The retained batch cannot be admitted, but active runs must still see
+        // current membership, permissions, cancellation and delivery checks.
+        for policy in runner.bridge.config.rooms.clone() {
+            let snapshot = adapter.snapshot(&policy.room_id).await?;
+            runner
+                .reconcile_room(&policy.room_id, &snapshot, now())
+                .await?;
+        }
+    }
     while runner.try_update()?.is_some() {}
     runner.tick(now()).await?;
     tokio::time::timeout(Duration::from_secs(15), adapter.deliver(runner))
         .await
         .context("Matrix delivery timed out")??;
     runner.poll_messages(now())?;
-    Ok(())
+    Ok(progress)
 }
 
 pub async fn run(config: Config, retry_event: Option<&str>) -> Result<()> {
@@ -557,7 +581,9 @@ pub async fn run(config: Config, retry_event: Option<&str>) -> Result<()> {
     if let Some(event_id) = retry_event {
         let event = configured_event(adapter.client(), &runner.bridge.config, event_id).await?;
         let snapshot = adapter.snapshot(&event.room_id).await?;
-        let context = adapter.context_for(&event).await?;
+        let context = adapter
+            .context_for(&event, &mut runner.bridge.store)
+            .await?;
         let handled = runner
             .ingest_with_context(&event, &snapshot, Some(&context), now())
             .await?;
@@ -565,13 +591,28 @@ pub async fn run(config: Config, retry_event: Option<&str>) -> Result<()> {
     }
     let mut failures = 0u32;
     let mut ready = false;
+    let mut last_key_warning: Option<std::time::Instant> = None;
     eprintln!("Connecting to Matrix; waiting for the first successful sync...");
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             result = one_step(&adapter, &mut runner) => match result {
-                Ok(()) => {
+                Ok(StepProgress::AwaitingKey) => {
                     failures = 0;
+                    if last_key_warning.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+                        eprintln!("Waiting for a missing room encryption key; encrypted batch retained, sync/key recovery and active-run maintenance continue");
+                        last_key_warning = Some(std::time::Instant::now());
+                    }
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                    }
+                },
+                Ok(StepProgress::Synced) => {
+                    failures = 0;
+                    if last_key_warning.take().is_some() {
+                        eprintln!("Encryption key recovered; retained batch processed");
+                    }
                     if !ready {
                         eprintln!("Ready. An approved operator can mention the bot in a configured room.");
                         ready = true;
